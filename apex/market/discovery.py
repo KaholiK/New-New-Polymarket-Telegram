@@ -115,7 +115,16 @@ def market_from_gamma(raw: dict[str, Any]) -> Market | None:
     if isinstance(tags_raw, list):
         tags = [str(t) for t in tags_raw if t]
 
-    catalog = map_catalog(question, tags=tags)
+    # Gamma's `events` field carries the parent event title (e.g. "2026 NHL Stanley
+    # Cup Champion"), which usually contains the sport name even when tags=None.
+    event_title: str | None = None
+    events_raw = raw.get("events")
+    if isinstance(events_raw, list) and events_raw:
+        first = events_raw[0]
+        if isinstance(first, dict):
+            event_title = str(first.get("title") or first.get("slug") or "") or None
+
+    catalog = map_catalog(question, tags=tags, event_title=event_title)
 
     return Market(
         condition_id=str(condition_id),

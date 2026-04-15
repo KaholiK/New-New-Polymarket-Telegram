@@ -108,6 +108,9 @@ class ApexEngine:
 
         # In-memory caches
         self.markets_by_condition: dict[str, Market] = {}
+        self.injuries_by_sport: dict[str, list] = {}
+        self.fresh_news: list = []
+        self.last_signals: list = []
         self.stats_counters = EngineStats()
 
     # ------------------------------------------------------------
@@ -149,36 +152,75 @@ class ApexEngine:
 
     async def ingest_stats(self) -> None:
         """Pull ESPN team stats into PowerRatingsModel."""
+        total = 0
         for sport, model in self.power_models.items():
             rows = await self.stats.fetch_team_stats(sport)
             if rows:
                 model.load(rows)
+                total += len(rows)
+        self.source_health.record_success("stats")
+        self.health.record_success("stats", 0.0)
+        logger.info("stats ingest: %d total team rows", total)
+
+    async def ingest_injuries(self) -> None:
+        """Pull ESPN injuries per sport."""
+        total = 0
+        for sport in DEFAULT_SPORTS:
+            rows = await self.injuries.fetch_injuries(sport)
+            self.injuries_by_sport[sport] = rows
+            total += len(rows)
+        self.source_health.record_success("injuries")
+        self.health.record_success("injuries", 0.0)
+        if total:
+            logger.info("injuries ingest: %d total entries", total)
+
+    async def ingest_news(self) -> None:
+        """Pull ESPN news per sport, dedup, keep the last ~100 fresh items."""
+        fresh: list = []
+        for sport in DEFAULT_SPORTS:
+            items = await self.news.fetch_news(sport)
+            items = self.news.filter_new(items)
+            fresh.extend(items)
+        # Keep most recent 100
+        self.fresh_news = (self.fresh_news + fresh)[-100:]
+        self.source_health.record_success("news")
+        self.health.record_success("news", 0.0)
+        if fresh:
+            logger.info("news ingest: %d new items", len(fresh))
 
     async def ingest_odds(self) -> dict[str, Any]:
         """Pull multi-book odds, build consensus, track line movement."""
         out: dict[str, Any] = {}
+        total = 0
         for sport in DEFAULT_SPORTS:
             snaps = await self.odds.fetch_odds(sport)
+            total += len(snaps)
             self.line_mov.ingest(snaps)
             consensus = build_consensus(snaps)
             out[sport] = consensus
         self.source_health.record_success("odds")
         self.health.record_success("odds", 0.0)
+        if total:
+            logger.info("odds ingest: %d snapshots across %d sports", total, len(DEFAULT_SPORTS))
         return out
 
     async def generate_signals(self) -> list:
         """Run each enabled strategy across all known markets."""
         all_signals = []
+        ages = {
+            "polymarket": self.source_health.age("polymarket"),
+            "odds": self.source_health.age("odds"),
+            "news": self.source_health.age("news"),
+            "injuries": self.source_health.age("injuries"),
+        }
         for market in self.markets_by_condition.values():
             fc = await self._forecast_market(market)
+            sport_injuries = self.injuries_by_sport.get(market.sport.value, [])
             ctx = DataContext(
                 forecast=fc,
-                source_ages={
-                    "polymarket": self.source_health.age("polymarket"),
-                    "odds": self.source_health.age("odds"),
-                    "news": self.source_health.age("news"),
-                    "injuries": self.source_health.age("injuries"),
-                },
+                fresh_injuries=sport_injuries,
+                fresh_news=self.fresh_news,
+                source_ages=ages,
             )
             for strat in self.strategies:
                 try:
@@ -189,6 +231,8 @@ class ApexEngine:
                 if sig is not None:
                     all_signals.append(sig)
         self.stats_counters.signals_generated = len(all_signals)
+        # Keep the most recent signals available to Telegram commands.
+        self.last_signals = all_signals[-50:]
         return all_signals
 
     async def _forecast_market(self, market: Market) -> Forecast | None:
@@ -196,12 +240,18 @@ class ApexEngine:
         cached = self.feature_cache.get(key)
         if cached is not None:
             return cached
+        injuries = self.injuries_by_sport.get(market.sport.value, [])
+        # Data freshness: worst of (polymarket, odds) normalized by 600s window.
+        ages = [self.source_health.age("polymarket"), self.source_health.age("odds")]
+        worst = max(a for a in ages if a != float("inf")) if any(a != float("inf") for a in ages) else 0.0
+        freshness = max(0.0, min(1.0, 1.0 - worst / 600.0))
         ctx = ForecastContext(
             market=market,
+            injuries=injuries,
             home_team=market.home_team or "",
             away_team=market.away_team or "",
             sport=market.sport,
-            data_freshness=1.0,
+            data_freshness=freshness,
         )
         try:
             fc = self.forecaster.forecast(ctx)

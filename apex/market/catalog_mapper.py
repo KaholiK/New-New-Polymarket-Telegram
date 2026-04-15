@@ -14,14 +14,41 @@ from apex.core.models import MarketType, Sport
 from apex.utils.parsing import extract_teams_from_title, fuzzy_ratio, resolve_team
 
 SPORT_KEYWORDS: dict[Sport, list[str]] = {
-    Sport.NBA: ["nba", "basketball", "lakers", "celtics", "warriors"],
-    Sport.NFL: ["nfl", "football", "super bowl", "cowboys", "chiefs", "eagles"],
-    Sport.MLB: ["mlb", "baseball", "world series", "yankees", "dodgers"],
-    Sport.NHL: ["nhl", "hockey", "stanley cup", "maple leafs", "bruins"],
-    Sport.UFC: ["ufc", "mma", "fight night"],
-    Sport.MLS: ["mls", "major league soccer"],
-    Sport.NCAAB: ["ncaab", "march madness", "college basketball"],
-    Sport.NCAAF: ["ncaaf", "college football", "bowl game"],
+    Sport.NBA: [
+        "nba", "basketball", "lakers", "celtics", "warriors", "nuggets", "heat",
+        "bucks", "knicks", "76ers", "sixers", "nets", "clippers", "mavericks",
+        "thunder", "suns", "timberwolves", "grizzlies", "pelicans", "kings",
+        "hawks", "hornets", "magic", "pistons", "cavaliers", "pacers",
+        "rockets", "spurs", "jazz", "trail blazers", "wizards", "raptors",
+        "nba championship", "nba finals", "nba mvp",
+    ],
+    Sport.NFL: [
+        "nfl", "football", "super bowl", "cowboys", "chiefs", "eagles", "49ers",
+        "bills", "ravens", "patriots", "packers", "giants", "jets", "dolphins",
+        "steelers", "bengals", "browns", "texans", "colts", "jaguars", "titans",
+        "broncos", "raiders", "chargers", "rams", "seahawks", "cardinals",
+        "vikings", "bears", "lions", "saints", "falcons", "panthers", "buccaneers",
+        "commanders", "afc", "nfc",
+    ],
+    Sport.MLB: [
+        "mlb", "baseball", "world series", "yankees", "dodgers", "red sox",
+        "mets", "cubs", "white sox", "astros", "phillies", "braves",
+        "angels", "padres", "mariners", "blue jays", "orioles",
+        "brewers", "reds", "twins", "tigers", "royals", "guardians",
+        "rays", "marlins", "nationals", "diamondbacks", "rockies", "athletics",
+        "al pennant", "nl pennant",
+    ],
+    Sport.NHL: [
+        "nhl", "hockey", "stanley cup", "maple leafs", "bruins",
+        "islanders", "canadiens", "red wings", "blackhawks", "avalanche",
+        "golden knights", "sharks", "lightning", "oilers",
+        "flames", "canucks", "ducks", "stars", "sabres", "hurricanes",
+        "capitals", "penguins", "flyers", "devils", "senators", "coyotes", "kraken",
+    ],
+    Sport.UFC: ["ufc", "mma", "fight night", "championship bout"],
+    Sport.MLS: ["mls", "major league soccer", "mls cup"],
+    Sport.NCAAB: ["ncaab", "march madness", "college basketball", "final four"],
+    Sport.NCAAF: ["ncaaf", "college football", "bowl game", "cfp"],
 }
 
 
@@ -110,9 +137,23 @@ def detect_market_type(title: str) -> MarketType:
     return MarketType.OTHER
 
 
-def map_catalog(title: str, tags: list[str] | None = None) -> CatalogInfo:
-    """Produce full catalog info for a market title."""
-    sport = detect_sport(title, tags)
+def map_catalog(
+    title: str,
+    tags: list[str] | None = None,
+    event_title: str | None = None,
+) -> CatalogInfo:
+    """Produce full catalog info for a market title.
+
+    `event_title` is the Gamma `events[0].title` (e.g. "2026 NHL Stanley Cup Champion"),
+    which often carries the sport label when `tags` is None (the common case).
+    """
+    # Combine title + event_title for sport detection — many Polymarket sports markets
+    # are futures like "Will the Hurricanes win the 2026 Stanley Cup?" where the sport
+    # word only appears in the event title.
+    detection_text = title
+    if event_title:
+        detection_text = f"{title} {event_title}"
+    sport = detect_sport(detection_text, tags)
     league = detect_league(sport)
     market_type = detect_market_type(title)
 
@@ -121,21 +162,23 @@ def map_catalog(title: str, tags: list[str] | None = None) -> CatalogInfo:
     canon_b = resolve_team(raw_b, sport=league) if raw_b and league else None
 
     # Confidence scoring:
-    # - 0.0 if sport unknown OR no teams extracted
     # - Baseline 0.5 if sport detected
-    # - +0.2 if both team names extracted
-    # - +0.2 if both teams resolve to canonical aliases
-    # - +0.1 if market_type detected
+    # - +0.15 if at least one team extracted (futures-style one-team markets OK)
+    # - +0.15 additional if both teams extracted (H2H style)
+    # - +0.15 if any extracted team resolves to canonical
+    # - +0.10 if market_type detected
     # Max 1.0.
     conf = 0.0
     if sport != Sport.UNKNOWN:
         conf += 0.5
+    if raw_a or raw_b:
+        conf += 0.15
     if raw_a and raw_b:
-        conf += 0.2
-    if canon_a and canon_b:
-        conf += 0.2
+        conf += 0.15
+    if canon_a or canon_b:
+        conf += 0.15
     if market_type != MarketType.OTHER:
-        conf += 0.1
+        conf += 0.10
     conf = min(1.0, conf)
 
     # Fuzzy adjustment: downgrade if canonical names disagree with input

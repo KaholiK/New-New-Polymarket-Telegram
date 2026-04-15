@@ -105,9 +105,95 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         query = " ".join(args) if args else ""
         fc = await engine.predict_by_query(query)
         if fc is None:
-            await update.message.reply_text("No matching market found.")
+            n = len(engine.markets_by_condition)
+            await update.message.reply_text(
+                f"No matching market found. ({n} markets in cache — try /scan first, then /markets)"
+            )
             return
         await update.message.reply_text(format_forecast(fc), parse_mode="HTML")
+
+    async def markets(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        args = ctx.args if getattr(ctx, "args", None) else []
+        sport_filter = args[0].upper() if args else None
+        all_m = list(engine.markets_by_condition.values())
+        if sport_filter:
+            all_m = [m for m in all_m if m.sport.value == sport_filter]
+        # Rank by volume
+        all_m.sort(key=lambda m: m.volume, reverse=True)
+        top = all_m[:15]
+        if not top:
+            await update.message.reply_text(
+                "No markets in cache. Run /scan to force a refresh.", parse_mode="HTML"
+            )
+            return
+        from apex.telegram.formatters import esc
+        lines = [f"<b>Markets</b> ({len(all_m)} total, top 15 by volume)"]
+        for m in top:
+            lines.append(
+                f"<code>{esc(m.sport.value):4}</code> vol ${m.volume:>7.0f} · "
+                f"{esc((m.home_team or '?')[:24])} · {esc(m.question[:60])}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def scan(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        await update.message.reply_text("🔄 Scanning Polymarket…")
+        try:
+            markets_found = await engine.scan_markets()
+        except Exception as exc:  # noqa: BLE001
+            await update.message.reply_text(f"Scan failed: {exc}")
+            return
+        from collections import Counter
+        by_sport = Counter(m.sport.value for m in markets_found)
+        breakdown = " · ".join(f"{s}:{n}" for s, n in by_sport.most_common())
+        await update.message.reply_text(
+            f"✅ Discovered {len(markets_found)} markets\n{breakdown}"
+        )
+
+    async def signals(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        from apex.telegram.formatters import esc
+        sigs = engine.last_signals
+        if not sigs:
+            await update.message.reply_text(
+                "No recent signals. Wait for the next strategy cycle or send /scan."
+            )
+            return
+        lines = [f"<b>Recent Signals</b> ({len(sigs)})"]
+        for s in sigs[:10]:
+            lines.append(
+                f"<b>{esc(s.strategy)}</b> · {esc(s.side.value)} · edge {s.edge:+.3f} "
+                f"(z={s.edge_zscore:+.2f}) · {esc(s.confidence.value)}"
+            )
+            if s.forecast:
+                lines.append(f"  {esc(s.forecast.home_team)} vs {esc(s.forecast.away_team)}")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def diagnostics(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        ec = engine.stats_counters
+        lines = [
+            "<b>Diagnostics</b>",
+            f"Markets: {len(engine.markets_by_condition)} (last scan: {ec.discovered_markets})",
+            f"Signals last cycle: {ec.signals_generated}",
+            f"Decisions approved: {ec.decisions_approved}",
+            f"Orders placed: {ec.orders_placed}",
+            f"News items: {len(engine.fresh_news)}",
+            f"Injury sports loaded: {len(engine.injuries_by_sport)}",
+            "Power models loaded: "
+            + ", ".join(
+                f"{sp}={len(m._stats_by_team)}"  # noqa: SLF001
+                for sp, m in engine.power_models.items()
+            ),
+            "Elo teams: "
+            + ", ".join(f"{sp}={len(m.ratings)}" for sp, m in engine.elo_models.items()),
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def pause(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
@@ -180,6 +266,10 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         "pnl": pnl,
         "positions": positions,
         "predict": predict,
+        "markets": markets,
+        "scan": scan,
+        "signals": signals,
+        "diagnostics": diagnostics,
         "pause": pause,
         "resume": resume,
         "kill": kill,

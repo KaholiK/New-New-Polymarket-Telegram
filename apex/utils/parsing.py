@@ -317,6 +317,21 @@ def extract_teams_from_title(title: str) -> tuple[str | None, str | None]:
     if m:
         return _clean_team(m.group(1)), _clean_team(m.group(2))
 
+    # Futures pattern: "Will the Lakers win the NBA championship?" → team_a=Lakers, team_b=None
+    # The championship/trophy context is surfaced by the sport detector separately.
+    m = re.search(
+        r"(?:will\s+(?:the\s+)?|does\s+(?:the\s+)?)(.+?)\s+(?:win|make|reach|advance|finish)",
+        t,
+        re.IGNORECASE,
+    )
+    if m:
+        return _clean_team(m.group(1)), None
+
+    # "<Team> to win the <event>"
+    m = re.search(r"(.+?)\s+to\s+win\s+(?:the\s+)?", t, re.IGNORECASE)
+    if m:
+        return _clean_team(m.group(1)), None
+
     return None, None
 
 
