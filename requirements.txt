@@ -1,0 +1,7 @@
+python-telegram-bot>=20.0
+httpx>=0.25
+aiosqlite>=0.19
+pydantic>=2.0
+pydantic-settings>=2.0
+apscheduler>=3.10
+numpy>=1.24

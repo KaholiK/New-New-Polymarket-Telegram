@@ -1,0 +1,13 @@
+services:
+  apex:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - apex_data:/app/data
+    environment:
+      - DB_PATH=/app/data/apex.db
+    restart: unless-stopped
+
+volumes:
+  apex_data:

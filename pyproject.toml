@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apex"
+version = "0.1.0"
+description = "APEX - Polymarket sports prediction-market trading bot"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "python-telegram-bot>=20.0",
+    "httpx>=0.25",
+    "aiosqlite>=0.19",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "apscheduler>=3.10",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1",
+]
+
+[tool.setuptools.packages.find]
+include = ["apex*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# E501: long lines are fine, we set line-length=110 but some regex/format strings exceed
+# B008: we use pydantic Field() in default args intentionally
+# B904: re-raising without `from` is fine in our retry loops
+# B007: loop vars not used in body are intentional in a few places
+# B905: zip without strict is fine here
+# UP042: keep str+Enum for pydantic compatibility
+ignore = ["E501", "B008", "B904", "B007", "B905", "UP042"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = "test_*.py"
