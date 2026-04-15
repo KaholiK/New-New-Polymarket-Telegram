@@ -3,10 +3,15 @@
 Every setting has a typed default so the bot can start in paper mode without a full .env.
 get_settings() is intentionally NOT lru_cached — strategies and other classes should call
 it dynamically so tests can monkeypatch values per-case.
+
+Credential strings are stripped of surrounding whitespace automatically. A leading
+space in .env (very common operator typo) would otherwise URL-encode as "+" or "%20"
+and silently break Telegram and Odds API calls.
 """
 
 from __future__ import annotations
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -97,6 +102,24 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    # Strip whitespace from all credential strings. Leading/trailing spaces in .env
+    # files are a common operator error and would URL-encode as "+" or "%20" when
+    # passed through httpx, silently breaking auth.
+    @field_validator(
+        "telegram_bot_token",
+        "odds_api_key",
+        "polymarket_private_key",
+        "polymarket_api_key",
+        "polymarket_api_secret",
+        "telegram_authorized_users",
+        mode="before",
+    )
+    @classmethod
+    def _strip_str(cls, v: str | None) -> str:
+        if v is None:
+            return ""
+        return str(v).strip()
 
     @property
     def authorized_user_ids(self) -> list[int]:

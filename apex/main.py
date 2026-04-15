@@ -26,11 +26,22 @@ async def main_async() -> None:
 
     app = None
     if settings.telegram_bot_token and settings.telegram_bot_token != "test_token":
-        app = build_application(engine, settings.telegram_bot_token)
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-        logger.info("telegram polling running")
+        try:
+            app = build_application(engine, settings.telegram_bot_token)
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling()
+            logger.info("telegram polling running")
+        except Exception as exc:  # noqa: BLE001
+            # Bad token, network issue, or missing deps → keep the engine/scheduler
+            # running in bot-less mode. The operator can fix .env and restart.
+            logger.error("telegram init failed (%s); continuing without bot", exc)
+            if app is not None:
+                try:
+                    await app.shutdown()
+                except Exception:  # noqa: BLE001
+                    pass
+            app = None
     else:
         logger.warning("no telegram token configured; bot-less mode")
 
