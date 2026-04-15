@@ -19,6 +19,10 @@ class FairValueStrategy(BaseStrategy):
         fc = context.forecast
         if fc is None:
             return None
+        # Skip single-team futures — Elo / power ratings / Poisson all need a real
+        # head-to-head matchup. Confidence can be artificially high on these.
+        if not fc.home_team or not fc.away_team:
+            return None
         if fc.confidence not in (Confidence.HIGH, Confidence.MEDIUM):
             return None
         if abs(fc.edge_zscore) < self.MIN_EDGE_ZSCORE:

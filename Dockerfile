@@ -25,7 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /root/.local /home/apex/.local
 COPY --chown=apex:apex apex ./apex
 COPY --chown=apex:apex scripts ./scripts
-COPY --chown=apex:apex pyproject.toml ./
+COPY --chown=apex:apex pyproject.toml start.sh ./
+RUN chmod +x start.sh && mkdir -p /app/data && chown apex:apex /app/data
 
 USER apex
 ENV PATH="/home/apex/.local/bin:${PATH}" \
@@ -40,4 +41,4 @@ VOLUME ["/app/data"]
 # Sanity check — importing all modules at build time catches breakage early.
 RUN python scripts/smoke.py
 
-CMD ["python", "-m", "apex.main"]
+ENTRYPOINT ["./start.sh"]

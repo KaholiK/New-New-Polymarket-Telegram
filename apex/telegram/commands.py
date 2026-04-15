@@ -195,6 +195,186 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         ]
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
+    async def bet(update: Any, ctx: Any) -> None:
+        """Usage: /bet <market_id|query> <YES|NO> <usd>."""
+        if not await _auth_or_reject(update):
+            return
+        args = ctx.args if getattr(ctx, "args", None) else []
+        if len(args) < 3:
+            await update.message.reply_text(
+                "Usage: <code>/bet &lt;market_id|query&gt; &lt;YES|NO&gt; &lt;usd&gt;</code>",
+                parse_mode="HTML",
+            )
+            return
+        ident = args[0]
+        side_str = args[1].upper()
+        try:
+            size_usd = float(args[2])
+        except ValueError:
+            await update.message.reply_text("Amount must be a number (e.g. 2.00).")
+            return
+        if side_str not in ("YES", "NO"):
+            await update.message.reply_text("Side must be YES or NO.")
+            return
+        # Resolve market: exact condition_id first, then fuzzy title match
+        mkt = engine.markets_by_condition.get(ident)
+        if mkt is None:
+            from apex.utils.parsing import fuzzy_ratio
+
+            best = None
+            for m in engine.markets_by_condition.values():
+                r = fuzzy_ratio(ident, m.question or "")
+                if best is None or r > best[1]:
+                    best = (m, r)
+            if best and best[1] >= 0.4:
+                mkt = best[0]
+        if mkt is None:
+            await update.message.reply_text(
+                f"No market matching '{ident}'. Try /markets first."
+            )
+            return
+        result = await engine.manual_bet(mkt, side_str, size_usd)
+        await update.message.reply_text(result, parse_mode="HTML")
+
+    async def orders(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        snap = engine.dry.snapshot()
+        if not snap:
+            await update.message.reply_text("No orders.")
+            return
+        from apex.telegram.formatters import esc
+        lines = [f"<b>Orders</b> ({len(snap)})"]
+        for o in snap[:20]:
+            lines.append(
+                f"  <code>{esc(o['id'][:8])}</code> {esc(o['status'])} "
+                f"filled {o['filled']:.2f} @ {o['avg_price']:.3f}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def fills(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        accs = engine.fills.all_accumulators()
+        if not accs:
+            await update.message.reply_text("No fills.")
+            return
+        from apex.telegram.formatters import esc
+        lines = [f"<b>Fills</b> ({len(accs)})"]
+        for acc in accs[:20]:
+            lines.append(
+                f"  <code>{esc(acc.order_id[:8])}</code> "
+                f"{acc.total_contracts:.2f} contracts @ {acc.avg_price:.3f} "
+                f"(${acc.total_usd:.2f})"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def exposure(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        from collections import defaultdict
+        by_sport = defaultdict(float)
+        for pos in engine.state.positions.values():
+            m = engine.markets_by_condition.get(pos.market_id)
+            sport = m.sport.value if m else "UNKNOWN"
+            by_sport[sport] += pos.cost_basis_usd
+        if not by_sport:
+            await update.message.reply_text("No exposure.")
+            return
+        from apex.telegram.formatters import esc
+        total = sum(by_sport.values())
+        lines = [f"<b>Exposure</b> — total ${total:.2f}"]
+        for sp, amt in sorted(by_sport.items(), key=lambda x: -x[1]):
+            pct = amt / max(1e-9, engine.state.bankroll)
+            lines.append(f"  {esc(sp)}: ${amt:.2f} ({pct:.1%} of bankroll)")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def heat(update: Any, ctx: Any) -> None:
+        """Alias/expanded version of /exposure — portfolio heat map."""
+        await exposure(update, ctx)
+
+    async def risk(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        from apex.risk.drawdown import check_drawdowns
+
+        dd = check_drawdowns(engine.state)
+        s = engine.settings
+        lines = [
+            "<b>Risk</b>",
+            f"Daily DD: {dd.daily_dd:.2%} (limit {s.daily_drawdown_pct:.0%})",
+            f"Peak DD: {dd.rolling_dd:.2%} (limit {s.rolling_drawdown_pct:.0%})",
+            f"Consecutive losses: {engine.state.consecutive_losses} / {s.max_consecutive_losses}",
+            f"Kelly fraction: {s.kelly_fraction} (small-roll {s.kelly_fraction_small_bankroll})",
+            f"Max position: {s.max_position_pct:.0%} bankroll",
+            f"Max sport exposure: {s.max_sport_exposure_pct:.0%}",
+            f"Min profit gate: ${s.min_profit_threshold}",
+        ]
+        if dd.daily_exceeded or dd.rolling_exceeded:
+            lines.append("⚠️ DRAWDOWN LIMIT HIT — trading halted")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def arb(update: Any, ctx: Any) -> None:
+        """Scan cached markets for YES+NO mispricing."""
+        if not await _auth_or_reject(update):
+            return
+        from apex.telegram.formatters import esc
+
+        candidates = []
+        for m in engine.markets_by_condition.values():
+            if m.yes_price <= 0 or m.no_price <= 0:
+                continue
+            total = m.yes_price + m.no_price
+            if total < 0.98:
+                candidates.append((m, total))
+        if not candidates:
+            await update.message.reply_text(
+                f"No arb (YES+NO < 0.98) in {len(engine.markets_by_condition)} markets."
+            )
+            return
+        candidates.sort(key=lambda x: x[1])
+        lines = [f"<b>Arb candidates</b> ({len(candidates)})"]
+        for m, total in candidates[:10]:
+            lines.append(
+                f"  {esc(m.sport.value):4} y+n={total:.3f} "
+                f"(y={m.yes_price:.3f} n={m.no_price:.3f}) · {esc(m.question[:70])}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def setstop(update: Any, ctx: Any) -> None:
+        """Usage: /setstop <market_id> <stop%> [take%] [trail%]"""
+        if not await _auth_or_reject(update):
+            return
+        args = ctx.args if getattr(ctx, "args", None) else []
+        if len(args) < 2:
+            await update.message.reply_text(
+                "Usage: <code>/setstop &lt;market_id&gt; &lt;stop%&gt; [take%] [trail%]</code>",
+                parse_mode="HTML",
+            )
+            return
+        market_id = args[0]
+        # Find the matching open position to get its side
+        pos_key = None
+        for key, p in engine.state.positions.items():
+            if p.market_id == market_id:
+                pos_key = p
+                break
+        if pos_key is None:
+            await update.message.reply_text("No open position for that market.")
+            return
+        try:
+            sl = float(args[1]) / 100.0
+            tp = float(args[2]) / 100.0 if len(args) > 2 else None
+            tr = float(args[3]) / 100.0 if len(args) > 3 else None
+        except ValueError:
+            await update.message.reply_text("Stop values must be numbers (e.g. 20 for 20%).")
+            return
+        engine.stops.set_rule(market_id, pos_key.side, sl, tp, tr)
+        await update.message.reply_text(
+            f"Stop set on {market_id[:10]} {pos_key.side.value}: "
+            f"SL={sl:.0%} TP={tp if tp is None else f'{tp:.0%}'} TR={tr if tr is None else f'{tr:.0%}'}"
+        )
+
     async def pause(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
             return
@@ -270,6 +450,14 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         "scan": scan,
         "signals": signals,
         "diagnostics": diagnostics,
+        "bet": bet,
+        "orders": orders,
+        "fills": fills,
+        "exposure": exposure,
+        "heat": heat,
+        "risk": risk,
+        "arb": arb,
+        "setstop": setstop,
         "pause": pause,
         "resume": resume,
         "kill": kill,

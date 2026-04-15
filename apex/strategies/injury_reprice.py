@@ -18,6 +18,11 @@ class InjuryRepriceStrategy(BaseStrategy):
         fc = context.forecast
         if fc is None:
             return None
+        # Skip futures / single-team markets: injury deltas are meaningless when there
+        # is no opposing team to compare against. Applies to "Will X win the 2026
+        # Stanley Cup?" style markets where `away_team` is empty.
+        if not fc.home_team or not fc.away_team:
+            return None
         if not self.freshness_ok(context):
             return None
         if not context.fresh_injuries:

@@ -1,0 +1,12 @@
+# Railway.app deployment config.
+# Railway picks the toml up first; the existing railway.json is kept as a
+# back-compat fallback (they describe the same build).
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python -m apex.main"
+restartPolicyType = "always"
+numReplicas = 1

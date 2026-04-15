@@ -56,14 +56,25 @@ python -m apex.main
 /scan           Force a Polymarket rescan now
 /markets [SP]   Show cached markets, optionally filtered by sport (NBA/NFL/MLB/NHL)
 /predict <q>    Full quant forecast for the best-matching market
+                (q can be a sport code, team name, or partial title)
 /signals        Recent signals from the strategy cycle
+/bet <m> <YES|NO> <$>
+                Place a paper bet by market_id or fuzzy query
+/orders         Recent orders
+/fills          Recent fills with blended avg price
 /positions      Open positions
+/exposure       Exposure breakdown by sport
+/heat           Alias of /exposure
 /pnl            Realized + unrealized P&L
 /bankroll       Current bankroll
+/risk           Drawdown limits, Kelly fractions, consecutive losses
+/arb            Scan for YES+NO < 0.98 mispricing
+/setstop <m> <stop%> [take%] [trail%]
+                Attach stop-loss / take-profit / trailing-stop rules
 /pause /resume  Halt / restart trading
-/kill           Emergency stop (requires inline keyboard confirmation)
+/kill           Emergency stop (inline keyboard confirmation)
 /paper_on       Force paper mode
-/paper_off      Switch to live (requires confirmation + DRY_RUN=false in .env)
+/paper_off      Switch to live (confirmation + DRY_RUN=false in .env)
 /cancel_all     Cancel all open orders
 ```
 
@@ -80,11 +91,12 @@ docker-compose down            # stop
 
 ### Railway.app (free-tier friendly)
 
-Railway detects `railway.json` and builds from the `Dockerfile`. Paper mode + $20
-bankroll fits within the free tier easily — no public ports are exposed.
+Railway reads `railway.toml` (with `railway.json` as fallback) and builds from the
+`Dockerfile`. Paper mode + $20 bankroll fits within the free tier easily —
+no public ports are exposed.
 
 1. Push this repo to GitHub.
-2. Sign in at https://railway.app, click **New Project → Deploy from GitHub repo**,
+2. Sign in at https://railway.app → **New Project → Deploy from GitHub repo**,
    select this repo and branch.
 3. In the project **Variables** tab, set:
    - `TELEGRAM_BOT_TOKEN` (from [@BotFather](https://t.me/BotFather))
@@ -93,12 +105,18 @@ bankroll fits within the free tier easily — no public ports are exposed.
      (ask [@userinfobot](https://t.me/userinfobot) if you don't know it)
    - `DRY_RUN=true`
    - `STARTING_BANKROLL=20`
-4. Railway builds the Dockerfile and starts the bot automatically. The scheduler
-   begins discovering markets on first tick (no manual action needed).
-5. Open Telegram and message the bot: `/status`, `/scan`, `/markets`, `/predict nba`.
+4. In **Settings → Volumes**, attach a volume at `/app/data` so SQLite state
+   (bankroll snapshots, Elo, trades, calibration) survives restarts.
+5. Railway builds the Dockerfile and starts the bot via `start.sh`. The scheduler
+   begins discovering markets on first tick — no manual action needed.
+6. Open Telegram and message the bot: `/status`, `/scan`, `/markets`, `/predict nba`.
 
 Railway also supports a `Procfile`-based buildpack if you prefer no-Docker builds —
 a `Procfile` is included (`worker: python -m apex.main`).
+
+`start.sh` is the single entrypoint for every platform; it `exec`s `python -m
+apex.main` so signals (SIGTERM) reach Python directly and the scheduler shuts
+down cleanly.
 
 ### Fly.io, Render, Heroku, etc.
 

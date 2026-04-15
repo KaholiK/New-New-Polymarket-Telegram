@@ -20,6 +20,9 @@ class NewsShockStrategy(BaseStrategy):
         fc = context.forecast
         if fc is None:
             return None
+        # H2H matchup required — news on a single team barely moves a futures price.
+        if not fc.home_team or not fc.away_team:
+            return None
         if not self.freshness_ok(context):
             return None
 

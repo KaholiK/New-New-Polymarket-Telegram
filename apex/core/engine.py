@@ -262,15 +262,60 @@ class ApexEngine:
         return fc
 
     async def predict_by_query(self, query: str) -> Forecast | None:
-        """Find a market by fuzzy title match, forecast it, return Forecast."""
+        """Find a market by best match across condition_id / sport / team / fuzzy-title.
+
+        Order of preference:
+          1. Exact condition_id
+          2. Sport code (NBA/NFL/MLB/NHL) → highest-volume market in that sport
+          3. Team/keyword token match → highest-volume
+          4. Fuzzy title fallback (loose threshold)
+        """
         if not query or not self.markets_by_condition:
             return None
+        q = query.strip()
+        q_lower = q.lower()
+
+        # 1. Exact condition_id
+        if q in self.markets_by_condition:
+            return await self._forecast_market(self.markets_by_condition[q])
+
+        markets = list(self.markets_by_condition.values())
+
+        # 2. Sport code shortcut
+        tokens = q_lower.split()
+        for sport in ("NBA", "NFL", "MLB", "NHL", "UFC", "MLS"):
+            if sport.lower() in tokens:
+                pool = [m for m in markets if m.sport.value == sport]
+                if pool:
+                    return await self._forecast_market(max(pool, key=lambda m: m.volume))
+
+        # 3. Team/keyword token match in home_team / away_team / title
+        search_tokens = [t for t in tokens if len(t) >= 3]
+        if search_tokens:
+            hits = []
+            for m in markets:
+                h = (m.home_team or "").lower()
+                a = (m.away_team or "").lower()
+                title = (m.question or "").lower()
+                score = 0
+                for t in search_tokens:
+                    if t in h or t in a:
+                        score += 2
+                    elif t in title:
+                        score += 1
+                if score > 0:
+                    hits.append((m, score))
+            if hits:
+                hits.sort(key=lambda x: (x[1], x[0].volume), reverse=True)
+                return await self._forecast_market(hits[0][0])
+
+        # 4. Fuzzy title fallback with loose threshold
         best: tuple[Market, float] | None = None
-        for m in self.markets_by_condition.values():
-            r = fuzzy_ratio(query, m.question or "")
+        for m in markets:
+            r = fuzzy_ratio(q, m.question or "")
             if best is None or r > best[1]:
                 best = (m, r)
-        if best is None or best[1] < 0.4:
+        if best is None or best[1] < 0.2:
             return None
         return await self._forecast_market(best[0])
 
@@ -314,6 +359,59 @@ class ApexEngine:
             model.update(r.home_team, r.away_team, home_won=home_won)
             await self.db.upsert_elo(r.sport, r.home_team, model.get(r.home_team))
             await self.db.upsert_elo(r.sport, r.away_team, model.get(r.away_team))
+
+    async def manual_bet(self, market: Market, side_str: str, size_usd: float) -> str:
+        """Place a paper bet manually from a Telegram /bet command.
+
+        Bypasses strategy scoring (this is operator-directed), but still respects
+        the state's kill/pause flags and debit guard.
+        """
+        import uuid
+
+        from apex.core.models import Order, OrderStatus, Side
+
+        if not self.state.is_trading_allowed:
+            return "Trading halted (kill/pause)."
+        side = Side.YES if side_str.upper() == "YES" else Side.NO
+        price = market.yes_price if side == Side.YES else market.no_price
+        if price <= 0 or price >= 1:
+            return f"Invalid price {price:.3f}."
+        contracts = size_usd / price
+        order = Order(
+            id=uuid.uuid4().hex,
+            market_id=market.condition_id,
+            token_id=market.yes_token_id if side == Side.YES else market.no_token_id,
+            side=side,
+            price=price,
+            size_usd=size_usd,
+            contracts=contracts,
+            status=OrderStatus.PENDING,
+            strategy="manual",
+            signal_id=f"manual:{market.condition_id}",
+            dry_run=self.settings.dry_run,
+        )
+        ok = await self.state.debit(size_usd, reason="manual_bet")
+        if not ok:
+            return f"Debit failed — bankroll ${self.state.bankroll:.2f}."
+        self.fills.register_order(order)
+        placed = await self.dry.place(order)
+        # Record a Position so /positions shows it immediately.
+        from apex.core.models import Position
+
+        pos = Position(
+            market_id=market.condition_id,
+            token_id=placed.token_id,
+            side=side,
+            contracts=placed.filled_contracts or contracts,
+            avg_entry_price=placed.avg_fill_price or price,
+            cost_basis_usd=size_usd,
+            current_price=price,
+        )
+        await self.state.upsert_position(pos)
+        return (
+            f"📋 Placed: <b>{side.value}</b> ${size_usd:.2f} @ {price:.3f} "
+            f"({contracts:.2f} contracts) on {market.question[:60]}"
+        )
 
     async def evaluate_and_place(self, signals: list) -> None:
         """Score each signal, then place approved decisions."""
