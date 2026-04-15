@@ -69,11 +69,47 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
     async def health(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
             return
-        snap = engine.health.snapshot()
-        text = "<b>Health</b>\n" + "\n".join(
-            f"{k}: {v}" for k, v in snap["sources"].items()
+        from apex.telegram.formatters import esc
+        from apex.utils.time_utils import format_duration
+
+        lines = ["<b>Data Sources</b>"]
+        sources = [
+            ("polymarket", "Gamma", f"{len(engine.markets_by_condition)} markets"),
+            ("odds", "Odds API", "multi-book"),
+            ("stats", "ESPN stats",
+             f"{sum(len(m._stats_by_team) for m in engine.power_models.values())} teams"),  # noqa: SLF001
+            ("injuries", "ESPN injuries",
+             f"{sum(len(v) for v in engine.injuries_by_sport.values())} entries"),
+            ("news", "ESPN news", f"{len(engine.fresh_news)} items"),
+        ]
+        for src, label, detail in sources:
+            age = engine.source_health.age(src)
+            state = engine.source_health.breaker(src).state
+            if age == float("inf"):
+                status = "❌ NEVER"
+                age_str = "—"
+            else:
+                limit = {
+                    "polymarket": engine.settings.polymarket_max_age,
+                    "odds": engine.settings.odds_max_age,
+                    "stats": engine.settings.results_tracker_interval * 2,
+                    "injuries": engine.settings.injury_max_age,
+                    "news": engine.settings.news_max_age,
+                }.get(src, 600)
+                status = "✅ OK" if age <= limit else "⚠️ STALE"
+                age_str = format_duration(age)
+            if state == "open":
+                status = "🛑 BREAKER OPEN"
+            lines.append(
+                f"  {status} <b>{esc(label):18}</b> {esc(detail):22} age={esc(age_str)}"
+            )
+        lines.append("")
+        lines.append(f"DB: {'✅ OK' if engine.health.db_healthy else '❌ ERROR'}")
+        lines.append(
+            f"Tasks running: {sum(1 for t in engine._tasks if not t.done())}/"  # noqa: SLF001
+            f"{len(engine._tasks)}"  # noqa: SLF001
         )
-        await update.message.reply_text(text, parse_mode="HTML")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def bankroll(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
@@ -103,11 +139,26 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
             return
         args = ctx.args if getattr(ctx, "args", None) else []
         query = " ".join(args) if args else ""
+        # No-arg fallback: forecast the highest-volume cached market.
+        if not query:
+            if not engine.markets_by_condition:
+                await update.message.reply_text(
+                    "No markets in cache. Run /scan, then try /predict <team|sport>."
+                )
+                return
+            top = max(engine.markets_by_condition.values(), key=lambda m: m.volume)
+            fc = await engine._forecast_market(top)  # noqa: SLF001
+            if fc is None:
+                await update.message.reply_text("Forecast failed on top market.")
+                return
+            await update.message.reply_text(format_forecast(fc), parse_mode="HTML")
+            return
         fc = await engine.predict_by_query(query)
         if fc is None:
             n = len(engine.markets_by_condition)
             await update.message.reply_text(
-                f"No matching market found. ({n} markets in cache — try /scan first, then /markets)"
+                f"No matching market for '{query}'. "
+                f"({n} markets in cache — try /markets NBA to browse)"
             )
             return
         await update.message.reply_text(format_forecast(fc), parse_mode="HTML")
@@ -120,21 +171,37 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         all_m = list(engine.markets_by_condition.values())
         if sport_filter:
             all_m = [m for m in all_m if m.sport.value == sport_filter]
-        # Rank by volume
         all_m.sort(key=lambda m: m.volume, reverse=True)
-        top = all_m[:15]
+        top = all_m[:10]
         if not top:
-            await update.message.reply_text(
-                "No markets in cache. Run /scan to force a refresh.", parse_mode="HTML"
-            )
+            if not engine.markets_by_condition:
+                await update.message.reply_text(
+                    "No markets in cache yet. Run /scan to force a refresh. "
+                    "(If the bot just started, try again in ~10 seconds.)",
+                    parse_mode="HTML",
+                )
+            else:
+                await update.message.reply_text(
+                    f"No markets for sport '{sport_filter}'. "
+                    f"Have {len(engine.markets_by_condition)} markets across "
+                    "all sports — try /markets without a filter.",
+                    parse_mode="HTML",
+                )
             return
         from apex.telegram.formatters import esc
-        lines = [f"<b>Markets</b> ({len(all_m)} total, top 15 by volume)"]
+        lines = [
+            f"<b>Markets</b> ({len(all_m)} total"
+            + (f" in {sport_filter}" if sport_filter else "")
+            + f", top {len(top)} by volume):"
+        ]
         for m in top:
+            title = (m.question or "")[:55]
             lines.append(
-                f"<code>{esc(m.sport.value):4}</code> vol ${m.volume:>7.0f} · "
-                f"{esc((m.home_team or '?')[:24])} · {esc(m.question[:60])}"
+                f"<b>{esc(m.sport.value)}</b> · vol ${m.volume:,.0f} · "
+                f"YES={m.yes_price:.3f} NO={m.no_price:.3f}"
             )
+            lines.append(f"  {esc(title)}")
+            lines.append(f"  <code>{esc(m.condition_id[:20])}...</code>")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def scan(update: Any, ctx: Any) -> None:
@@ -158,19 +225,46 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
             return
         from apex.telegram.formatters import esc
         sigs = engine.last_signals
-        if not sigs:
-            await update.message.reply_text(
-                "No recent signals. Wait for the next strategy cycle or send /scan."
-            )
-            return
-        lines = [f"<b>Recent Signals</b> ({len(sigs)})"]
-        for s in sigs[:10]:
-            lines.append(
-                f"<b>{esc(s.strategy)}</b> · {esc(s.side.value)} · edge {s.edge:+.3f} "
-                f"(z={s.edge_zscore:+.2f}) · {esc(s.confidence.value)}"
-            )
-            if s.forecast:
-                lines.append(f"  {esc(s.forecast.home_team)} vs {esc(s.forecast.away_team)}")
+        lines: list[str] = []
+        # Section 1: fired signals (if any)
+        if sigs:
+            lines.append(f"<b>🔥 Fired Signals</b> ({len(sigs)})")
+            for s in sigs[:10]:
+                lines.append(
+                    f"  <b>{esc(s.strategy)}</b> · {esc(s.side.value)} · "
+                    f"edge {s.edge:+.3f} (z={s.edge_zscore:+.2f}) · {esc(s.confidence.value)}"
+                )
+                if s.forecast:
+                    matchup = s.forecast.home_team
+                    if s.forecast.away_team:
+                        matchup += f" vs {s.forecast.away_team}"
+                    lines.append(f"    {esc(matchup)}")
+        else:
+            lines.append("<b>🔥 Fired Signals</b>: none this cycle")
+        # Section 2: top candidates (always shown so operator sees the brain thinking)
+        cands = engine.last_candidates
+        if cands:
+            lines.append("")
+            lines.append(f"<b>Top Candidates</b> (top 5 of {len(cands)}):")
+            for c in cands[:5]:
+                status = "✅ actionable" if c["is_actionable"] else "⏸"
+                matchup = c["home_team"] or "?"
+                if c["away_team"]:
+                    matchup += f" vs {c['away_team']}"
+                lines.append(
+                    f"  {status} {esc(c['sport']):4} edge {c['edge']:+.3f} "
+                    f"(z={c['edge_zscore']:+.2f}) conf={esc(c['confidence'])}"
+                )
+                lines.append(f"    {esc(matchup[:60])}")
+                if c["fired_strategies"]:
+                    lines.append(f"    fired: {esc(', '.join(c['fired_strategies']))}")
+                if c["rejection_reasons"]:
+                    lines.append(
+                        f"    reasons: {esc(', '.join(c['rejection_reasons'][:3]))}"
+                    )
+        else:
+            lines.append("")
+            lines.append("No candidates yet — wait for next strategy cycle or /scan.")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def diagnostics(update: Any, ctx: Any) -> None:

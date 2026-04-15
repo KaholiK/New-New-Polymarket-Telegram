@@ -3,10 +3,17 @@
 This module composes: discovery, odds ingestion, forecaster, strategies, decision engine,
 order manager, CLV tracker, resolution monitor. It is the single owner of long-lived
 state (BotState, DB, health registry).
+
+Scheduling: pure asyncio. Each periodic job is an `asyncio.Task` that sleeps between
+ticks using `self._shutdown.wait()` so shutdown is instant. We don't use APScheduler —
+its coroutine-function handling has caused "coroutine never awaited" bugs every time
+this codebase tries to use it.
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -111,21 +118,122 @@ class ApexEngine:
         self.injuries_by_sport: dict[str, list] = {}
         self.fresh_news: list = []
         self.last_signals: list = []
+        self.last_candidates: list = []  # top signal candidates with scores/reasons
         self.stats_counters = EngineStats()
+
+        # Background task lifecycle
+        self._shutdown = asyncio.Event()
+        self._tasks: list[asyncio.Task] = []
 
     # ------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------
 
     async def startup(self) -> None:
+        """Bring the engine fully online and populate caches before returning.
+
+        Runs DB connect + Elo restore, then fires every ingest job once so that the
+        Telegram commands have real data to return within seconds of boot. This is
+        important on platforms like Railway where the operator can send commands
+        immediately after deploy.
+        """
         await self.db.connect()
         # Restore Elo
         for sport, model in self.elo_models.items():
             rows = await self.db.load_elo(sport)
             model.bulk_load(rows)
-        logger.info("engine: startup complete, bankroll=$%.2f", self.state.bankroll)
+        logger.info("engine: core up, bankroll=$%.2f; running initial ingest…", self.state.bankroll)
+
+        # Fire each ingest ONCE on startup, in parallel, so /markets, /predict etc.
+        # have data immediately. Any source that fails is logged but does not abort
+        # startup — paper mode must survive a bad external dependency.
+        initial_jobs = {
+            "scan_markets": self.scan_markets(),
+            "ingest_stats": self.ingest_stats(),
+            "ingest_odds": self.ingest_odds(),
+            "ingest_injuries": self.ingest_injuries(),
+            "ingest_news": self.ingest_news(),
+        }
+        results = await asyncio.gather(*initial_jobs.values(), return_exceptions=True)
+        for name, res in zip(initial_jobs.keys(), results):
+            if isinstance(res, Exception):
+                logger.warning("initial %s failed: %s", name, res)
+        logger.info(
+            "engine: initial ingest done — %d markets, %d injuries_sports, %d news, %d elo_teams",
+            len(self.markets_by_condition),
+            len(self.injuries_by_sport),
+            len(self.fresh_news),
+            sum(len(m.ratings) for m in self.elo_models.values()),
+        )
+
+    def start_periodic_tasks(self) -> None:
+        """Schedule every periodic job as an asyncio.Task.
+
+        Must be called from inside a running event loop (main_async does this).
+        Each task runs `_run_periodic` which sleeps on the shutdown event so that
+        stopping the engine cancels all loops within milliseconds.
+        """
+        s = self.settings
+
+        async def _cycle() -> None:
+            signals = await self.generate_signals()
+            await self.evaluate_and_place(signals)
+
+        jobs: list[tuple[str, Callable[[], Awaitable[Any]], int]] = [
+            ("scan_markets", self.scan_markets, s.market_scan_interval),
+            ("ingest_odds", self.ingest_odds, s.strategy_cycle_interval),
+            ("ingest_stats", self.ingest_stats, s.results_tracker_interval),
+            ("ingest_injuries", self.ingest_injuries, max(60, s.injury_max_age // 2)),
+            ("ingest_news", self.ingest_news, max(60, s.news_max_age // 2)),
+            ("strategy_cycle", _cycle, s.strategy_cycle_interval),
+            ("poll_fills", self.poll_fills, s.fill_poll_interval),
+            ("poll_resolutions", self.poll_resolutions, s.resolution_poll_interval),
+            ("poll_results", self.poll_results, s.results_tracker_interval),
+        ]
+
+        for name, fn, interval in jobs:
+            task = asyncio.create_task(
+                self._run_periodic(name, fn, interval),
+                name=f"apex:{name}",
+            )
+            self._tasks.append(task)
+        logger.info("engine: %d periodic tasks started", len(self._tasks))
+
+    async def _run_periodic(
+        self, name: str, fn: Callable[[], Awaitable[Any]], interval: int
+    ) -> None:
+        """Run `fn` every `interval` seconds until shutdown is signalled.
+
+        Any exception is logged and swallowed so one bad tick doesn't kill the loop.
+        Sleep uses `wait_for(shutdown_event)` so shutdown cancels immediately.
+        """
+        # Stagger initial delay slightly so all jobs don't hammer external APIs at once
+        # (startup() already did the first ingest synchronously for all critical sources).
+        try:
+            await asyncio.wait_for(self._shutdown.wait(), timeout=min(interval, 5.0))
+            return  # shutdown during stagger
+        except TimeoutError:
+            pass
+
+        while not self._shutdown.is_set():
+            try:
+                await fn()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("job %s failed: %s", name, exc)
+            # Wake early on shutdown, else sleep full interval
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=float(interval))
+                return
+            except TimeoutError:
+                continue
 
     async def shutdown(self) -> None:
+        self._shutdown.set()
+        for t in self._tasks:
+            t.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
         await self.polymarket.aclose()
         await self.odds.aclose()
         await self.injuries.aclose()
@@ -205,8 +313,14 @@ class ApexEngine:
         return out
 
     async def generate_signals(self) -> list:
-        """Run each enabled strategy across all known markets."""
+        """Run each enabled strategy across all known markets.
+
+        Also records the top-10 forecast candidates (by absolute raw-edge) in
+        `self.last_candidates` so `/signals` can show what the brain was looking at
+        even when no strategy fired.
+        """
         all_signals = []
+        candidates: list[tuple[float, Any]] = []  # (score_key, {...info...})
         ages = {
             "polymarket": self.source_health.age("polymarket"),
             "odds": self.source_health.age("odds"),
@@ -222,6 +336,7 @@ class ApexEngine:
                 fresh_news=self.fresh_news,
                 source_ages=ages,
             )
+            fired_for_market: list[str] = []
             for strat in self.strategies:
                 try:
                     sig = await strat.signal(market, ctx)
@@ -230,9 +345,36 @@ class ApexEngine:
                     continue
                 if sig is not None:
                     all_signals.append(sig)
+                    fired_for_market.append(strat.name)
+            # Record candidate entry regardless of fire status
+            if fc is not None:
+                candidates.append(
+                    (
+                        abs(fc.raw_edge),
+                        {
+                            "market_id": market.condition_id,
+                            "title": market.question,
+                            "sport": market.sport.value,
+                            "home_team": fc.home_team,
+                            "away_team": fc.away_team,
+                            "side": fc.side.value,
+                            "edge": fc.raw_edge,
+                            "edge_zscore": fc.edge_zscore,
+                            "ensemble_prob": fc.ensemble_prob,
+                            "market_price": fc.market_price,
+                            "confidence": fc.confidence.value,
+                            "is_actionable": fc.is_actionable,
+                            "rejection_reasons": list(fc.rejection_reasons),
+                            "fired_strategies": fired_for_market,
+                        },
+                    )
+                )
         self.stats_counters.signals_generated = len(all_signals)
         # Keep the most recent signals available to Telegram commands.
         self.last_signals = all_signals[-50:]
+        # Top 10 candidates by |edge|
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        self.last_candidates = [c[1] for c in candidates[:10]]
         return all_signals
 
     async def _forecast_market(self, market: Market) -> Forecast | None:
