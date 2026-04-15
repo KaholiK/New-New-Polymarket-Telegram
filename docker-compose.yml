@@ -1,13 +1,20 @@
 services:
   apex:
     build: .
+    container_name: apex
+    restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # Ensure the DB lives on the mounted volume even if .env overrides DB_PATH
+      DB_PATH: /app/data/apex.db
     volumes:
       - apex_data:/app/data
-    environment:
-      - DB_PATH=/app/data/apex.db
-    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   apex_data:
