@@ -154,23 +154,27 @@ class ApexEngine:
         """Bring the engine fully online and populate caches before returning.
 
         Runs DB connect + Elo restore, then fires every ingest job once so that the
-        Telegram commands have real data to return within seconds of boot. This is
-        important on platforms like Railway where the operator can send commands
-        immediately after deploy.
+        Telegram commands have real data to return within seconds of boot.
 
-        Sets `self.startup_complete = True` at the end so Telegram handlers can
-        distinguish "no data yet" from "no data ever".
+        CRITICAL: `self.startup_complete` is set in a `finally` block so it is
+        guaranteed to become True even if DB connect or Elo restore fails. Without
+        this, every data command would be gated by ``_wait_for_startup`` forever.
         """
         import time
 
         self.startup_started_at = time.monotonic()
-        await self.db.connect()
-        # Wire the DB into the cost tracker now that it's open.
-        self.cost_tracker.db = self.db
-        # Restore Elo
-        for sport, model in self.elo_models.items():
-            rows = await self.db.load_elo(sport)
-            model.bulk_load(rows)
+        try:
+            await self.db.connect()
+            self.cost_tracker.db = self.db
+            for sport, model in self.elo_models.items():
+                try:
+                    rows = await self.db.load_elo(sport)
+                    model.bulk_load(rows)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("elo restore %s failed: %s", sport, exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("db/elo init failed: %s — continuing without persistence", exc)
+
         logger.info(
             "engine: core up, bankroll=$%.2f, claude=%s, sportsdata=%s; running initial ingest…",
             self.state.bankroll,
@@ -178,23 +182,28 @@ class ApexEngine:
             "on" if self.sportsdata.enabled else "off",
         )
 
-        # Fire each ingest ONCE on startup, in parallel, so /markets, /predict etc.
-        # have data immediately. Any source that fails is logged but does not abort
-        # startup — paper mode must survive a bad external dependency.
-        initial_jobs = {
-            "scan_markets": self.scan_markets(),
-            "ingest_stats": self.ingest_stats(),
-            "ingest_odds": self.ingest_odds(),
-            "ingest_injuries": self.ingest_injuries(),
-            "ingest_news": self.ingest_news(),
-        }
-        results = await asyncio.gather(*initial_jobs.values(), return_exceptions=True)
-        for name, res in zip(initial_jobs.keys(), results):
-            if isinstance(res, Exception):
-                logger.warning("initial %s failed: %s", name, res)
-        self.startup_complete = True
+        try:
+            initial_jobs = {
+                "scan_markets": self.scan_markets(),
+                "ingest_stats": self.ingest_stats(),
+                "ingest_odds": self.ingest_odds(),
+                "ingest_injuries": self.ingest_injuries(),
+                "ingest_news": self.ingest_news(),
+            }
+            results = await asyncio.gather(*initial_jobs.values(), return_exceptions=True)
+            for name, res in zip(initial_jobs.keys(), results):
+                if isinstance(res, Exception):
+                    logger.warning("initial %s failed: %s", name, res)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("initial ingest gather failed: %s", exc)
+        finally:
+            # ALWAYS set startup_complete — even if everything above blew up.
+            # The bot is more useful returning "0 markets" than perpetually saying
+            # "starting up, please wait".
+            self.startup_complete = True
+
         logger.info(
-            "engine: initial ingest done — %d markets, %d injuries_sports, %d news, %d elo_teams",
+            "engine: startup_complete=True — %d markets, %d injury_sports, %d news, %d elo_teams",
             len(self.markets_by_condition),
             len(self.injuries_by_sport),
             len(self.fresh_news),
