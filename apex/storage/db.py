@@ -170,6 +170,20 @@ SCHEMA_STATEMENTS: list[str] = [
         updated_at TEXT
     )
     """,
+    # Anthropic API cost ledger (one row per call)
+    """
+    CREATE TABLE IF NOT EXISTS anthropic_costs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        day_bucket TEXT NOT NULL,
+        model TEXT,
+        input_tokens INTEGER DEFAULT 0,
+        output_tokens INTEGER DEFAULT 0,
+        cost_usd REAL DEFAULT 0,
+        market_id TEXT,
+        ok INTEGER DEFAULT 1
+    )
+    """,
 ]
 
 
@@ -482,3 +496,40 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    # --- Anthropic cost ledger ---
+
+    async def record_anthropic_cost(self, row: dict[str, Any]) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO anthropic_costs
+            (ts, day_bucket, model, input_tokens, output_tokens, cost_usd, market_id, ok)
+            VALUES (:ts, :day_bucket, :model, :input_tokens, :output_tokens, :cost_usd,
+                    :market_id, :ok)
+            """,
+            row,
+        )
+        await self.conn.commit()
+
+    async def anthropic_cost_for_day(self, day_bucket: str) -> float:
+        async with self.conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS total FROM anthropic_costs WHERE day_bucket = ?",
+            (day_bucket,),
+        ) as cur:
+            row = await cur.fetchone()
+            return float(row["total"]) if row else 0.0
+
+    async def anthropic_cost_last_n_days(self, n: int = 7) -> list[dict[str, Any]]:
+        async with self.conn.execute(
+            """
+            SELECT day_bucket, COUNT(*) AS calls,
+                   SUM(input_tokens) AS in_tok, SUM(output_tokens) AS out_tok,
+                   SUM(cost_usd) AS cost
+            FROM anthropic_costs
+            GROUP BY day_bucket
+            ORDER BY day_bucket DESC
+            LIMIT ?
+            """,
+            (n,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]

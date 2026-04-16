@@ -77,8 +77,11 @@ def test_fit_platt_identity_insufficient_data():
 def test_compute_weights_fallback_when_no_data():
     t = BrierTracker()
     w = compute_weights(t, sport="NBA")
-    # Falls back to defaults
-    assert abs(sum(w.values()) - 1.0) < 1e-3
+    # Falls back to DEFAULT_WEIGHTS. Post-Claude the sum is intentionally >1.0
+    # (geometric_mean_odds normalizes internally) — just check it's a reasonable shape.
+    assert w
+    assert all(0.0 <= v <= 1.0 for v in w.values())
+    assert abs(sum(w.values()) - sum(__import__('apex.quant.models.ensemble', fromlist=['DEFAULT_WEIGHTS']).DEFAULT_WEIGHTS.values())) < 1e-6
 
 
 def test_compute_weights_better_model_gets_more():

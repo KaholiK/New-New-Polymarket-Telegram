@@ -44,6 +44,24 @@ async def _auth_or_reject(update: Any) -> bool:
     return True
 
 
+async def _wait_for_startup(engine: Any, update: Any) -> bool:
+    """Block data commands from replying with empty results during cold-start.
+
+    Returns True if startup is complete; otherwise replies with a friendly
+    "starting up" message and returns False. Safe to call on every data command.
+    """
+    if getattr(engine, "startup_complete", False):
+        return True
+    if getattr(update, "message", None):
+        try:
+            await update.message.reply_text(
+                "⏳ APEX is starting up, please wait a few seconds and try again."
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
 def make_handlers(engine: ApexEngine) -> dict[str, Any]:
     """Return dict of command_name → async handler closure bound to engine."""
 
@@ -68,6 +86,8 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
 
     async def health(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
+            return
+        if not await _wait_for_startup(engine, update):
             return
         from apex.telegram.formatters import esc
         from apex.utils.time_utils import format_duration
@@ -104,6 +124,17 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
                 f"  {status} <b>{esc(label):18}</b> {esc(detail):22} age={esc(age_str)}"
             )
         lines.append("")
+        lines.append("<b>Upgrades</b>")
+        claude_status = "✅ ON" if engine.claude.enabled else "➖ OFF (no key)"
+        today = engine.cost_tracker.today_cost()
+        cap = engine.cost_tracker.daily_cap_usd
+        lines.append(
+            f"  {claude_status} Claude ({esc(engine.settings.anthropic_model)}) "
+            f"— spent ${today:.4f}/${cap:.2f} today"
+        )
+        sportsdata_status = "✅ ON" if engine.sportsdata.enabled else "➖ OFF (no key)"
+        lines.append(f"  {sportsdata_status} SportsDataIO")
+        lines.append("")
         lines.append(f"DB: {'✅ OK' if engine.health.db_healthy else '❌ ERROR'}")
         lines.append(
             f"Tasks running: {sum(1 for t in engine._tasks if not t.done())}/"  # noqa: SLF001
@@ -137,6 +168,8 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
     async def predict(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
             return
+        if not await _wait_for_startup(engine, update):
+            return
         args = ctx.args if getattr(ctx, "args", None) else []
         query = " ".join(args) if args else ""
         # No-arg fallback: forecast the highest-volume cached market.
@@ -165,6 +198,8 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
 
     async def markets(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
+            return
+        if not await _wait_for_startup(engine, update):
             return
         args = ctx.args if getattr(ctx, "args", None) else []
         sport_filter = args[0].upper() if args else None
@@ -207,6 +242,8 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
     async def scan(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
             return
+        if not await _wait_for_startup(engine, update):
+            return
         await update.message.reply_text("🔄 Scanning Polymarket…")
         try:
             markets_found = await engine.scan_markets()
@@ -222,6 +259,8 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
 
     async def signals(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
+            return
+        if not await _wait_for_startup(engine, update):
             return
         from apex.telegram.formatters import esc
         sigs = engine.last_signals
@@ -292,6 +331,8 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
     async def bet(update: Any, ctx: Any) -> None:
         """Usage: /bet <market_id|query> <YES|NO> <usd>."""
         if not await _auth_or_reject(update):
+            return
+        if not await _wait_for_startup(engine, update):
             return
         args = ctx.args if getattr(ctx, "args", None) else []
         if len(args) < 3:
@@ -412,6 +453,8 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         """Scan cached markets for YES+NO mispricing."""
         if not await _auth_or_reject(update):
             return
+        if not await _wait_for_startup(engine, update):
+            return
         from apex.telegram.formatters import esc
 
         candidates = []
@@ -433,6 +476,44 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
                 f"  {esc(m.sport.value):4} y+n={total:.3f} "
                 f"(y={m.yes_price:.3f} n={m.no_price:.3f}) · {esc(m.question[:70])}"
             )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def costs(update: Any, ctx: Any) -> None:
+        """Show daily + weekly Anthropic API spend vs. cap."""
+        if not await _auth_or_reject(update):
+            return
+        from apex.telegram.formatters import esc
+
+        summary = await engine.cost_tracker.summary(n_days=7)
+        pct = 0.0
+        if summary["daily_cap_usd"] > 0:
+            pct = summary["today_cost_usd"] / summary["daily_cap_usd"]
+        status = "🟢"
+        if pct >= 1.0:
+            status = "🛑 CAPPED"
+        elif pct >= 0.8:
+            status = "🟠"
+        lines = [
+            "<b>Anthropic API Costs</b>",
+            f"Model: <code>{esc(engine.settings.anthropic_model)}</code>",
+            f"{status} Today: ${summary['today_cost_usd']:.4f} / "
+            f"${summary['daily_cap_usd']:.2f} cap ({pct:.1%})",
+            f"Remaining: ${summary['remaining_usd']:.4f}",
+            f"7-day total: ${summary['week_cost_usd']:.4f}",
+        ]
+        days = summary.get("days") or []
+        if days:
+            lines.append("")
+            lines.append("<b>Last 7 days</b>")
+            for d in days:
+                lines.append(
+                    f"  {esc(str(d.get('day_bucket')))}: "
+                    f"{int(d.get('calls') or 0)} calls, "
+                    f"${float(d.get('cost') or 0):.4f}"
+                )
+        if not engine.claude.enabled:
+            lines.append("")
+            lines.append("⚠️ Claude disabled (no ANTHROPIC_API_KEY or SDK init failed).")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def setstop(update: Any, ctx: Any) -> None:
@@ -551,6 +632,7 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         "heat": heat,
         "risk": risk,
         "arb": arb,
+        "costs": costs,
         "setstop": setstop,
         "pause": pause,
         "resume": resume,

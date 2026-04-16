@@ -124,7 +124,7 @@ def format_help() -> str:
         "/pnl /bankroll /exposure\n"
         "/risk /diagnostics /logs\n"
         "/models /calibration /clv /forecast_history\n"
-        "/heat /arb\n"
+        "/heat /arb /costs\n"
         "/setstop &lt;ticker&gt; &lt;s%&gt; [t%] [tr%]\n"
         "/hedge &lt;ticker&gt; [pct]\n"
         "/pause /resume /kill /cancel_all\n"

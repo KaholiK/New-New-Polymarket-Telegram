@@ -7,11 +7,16 @@ from dataclasses import dataclass
 from apex.core.models import Confidence, ModelEstimate
 from apex.utils.math_utils import clamp_prob, geometric_mean_odds
 
-# Fallback weights if no calibration history available
+# Fallback weights if no calibration history available.
+# `claude` is the highest-weighted model when it's available and its daily budget
+# hasn't been exhausted — it incorporates context pure math can't (rotations,
+# rivalry dynamics, coach tendencies). If the Claude estimate is missing, the
+# other weights renormalize automatically because combine() skips Nones.
 DEFAULT_WEIGHTS: dict[str, float] = {
-    "market_implied": 0.35,
-    "elo": 0.20,
-    "power_ratings": 0.20,
+    "claude": 0.30,
+    "market_implied": 0.25,
+    "elo": 0.15,
+    "power_ratings": 0.15,
     "poisson": 0.10,
     "situational": 0.10,
     "injury": 0.05,

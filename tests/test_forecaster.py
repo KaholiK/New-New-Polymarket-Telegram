@@ -194,3 +194,58 @@ def test_forecast_no_team_data():
     fc = f.forecast(ctx)
     # Only 1-2 models → likely not actionable
     assert fc.is_actionable is False or fc.ensemble_prob > 0
+
+
+def test_re_ensemble_with_claude_folds_estimate():
+    """`re_ensemble_with_claude` must add Claude's estimate and recompute edge + side."""
+    from apex.core.models import ModelEstimate
+    from apex.quant.forecaster import re_ensemble_with_claude
+
+    f = _make_forecaster()
+    ctx = ForecastContext(
+        market=_make_market(yes_price=0.48),
+        home_team="Los Angeles Lakers",
+        away_team="Boston Celtics",
+        sport=Sport.NBA,
+    )
+    fc = f.forecast(ctx)
+    before_prob = fc.ensemble_prob
+    # Claude disagrees strongly with the basic ensemble
+    claude = ModelEstimate(
+        model_name="claude",
+        probability=0.70,
+        uncertainty=0.03,
+        confidence=0.85,
+        factors=["starter returning", "home crowd edge", "rivalry"],
+    )
+    fc2 = re_ensemble_with_claude(fc, claude)
+    assert "claude" in fc2.model_estimates
+    # Claude's 0.30 weight should move the ensemble upward
+    assert fc2.ensemble_prob > before_prob
+    # Edge should now be positive (ensemble > market_price)
+    assert fc2.raw_edge > 0
+    # Claude factors prepended
+    assert any("🤖" in f for f in fc2.key_factors)
+
+
+def test_re_ensemble_preserves_key_factors_cap():
+    from apex.core.models import ModelEstimate
+    from apex.quant.forecaster import re_ensemble_with_claude
+
+    f = _make_forecaster()
+    ctx = ForecastContext(
+        market=_make_market(),
+        home_team="Los Angeles Lakers",
+        away_team="Boston Celtics",
+        sport=Sport.NBA,
+    )
+    fc = f.forecast(ctx)
+    claude = ModelEstimate(
+        model_name="claude",
+        probability=0.55,
+        uncertainty=0.04,
+        confidence=0.7,
+        factors=["a", "b", "c", "d", "e"],
+    )
+    fc2 = re_ensemble_with_claude(fc, claude)
+    assert len(fc2.key_factors) <= 5

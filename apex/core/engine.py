@@ -30,6 +30,7 @@ from apex.data.news_monitor import NewsMonitor
 from apex.data.odds_ingestor import OddsIngestor
 from apex.data.score_feed import ScoreFeed
 from apex.data.source_health import SourceHealthTracker
+from apex.data.sportsdata_client import SportsDataClient
 from apex.execution.clv_tracker import CLVTracker
 from apex.execution.dry_run_exchange import DryRunExchange
 from apex.execution.fill_tracker import FillTracker
@@ -41,10 +42,12 @@ from apex.market.polymarket_client import PolymarketClient
 from apex.meta.decision_engine import evaluate_signal
 from apex.quant.calibration.brier_tracker import BrierTracker
 from apex.quant.calibration.calibrator import Calibrator
+from apex.quant.calibration.cost_tracker import CostTracker
 from apex.quant.data.feature_cache import FeatureCache
 from apex.quant.data.results_tracker import ResultsTracker
 from apex.quant.data.stats_ingestor import StatsIngestor
-from apex.quant.forecaster import ForecastContext, Forecaster
+from apex.quant.forecaster import ForecastContext, Forecaster, re_ensemble_with_claude
+from apex.quant.models.claude_analyzer import ClaudeAnalyzer
 from apex.quant.models.elo import EloModel
 from apex.quant.models.power_ratings import PowerRatingsModel
 from apex.storage.db import Database
@@ -84,6 +87,20 @@ class ApexEngine:
         self.news = NewsMonitor(client=self._http)
         self.scores = ScoreFeed(client=self._http)
         self.stats = StatsIngestor(client=self._http)
+        self.sportsdata = SportsDataClient(
+            self.settings.sportsdata_api_key, client=self._http
+        )
+
+        # Anthropic cost tracker + analyzer (optional — degrade if no key)
+        self.cost_tracker = CostTracker(
+            db=None,  # wired in startup after db connects
+            daily_cap_usd=self.settings.anthropic_daily_cap_usd,
+        )
+        self.claude = ClaudeAnalyzer(
+            api_key=self.settings.anthropic_api_key,
+            model=self.settings.anthropic_model,
+            cost_tracker=self.cost_tracker,
+        )
 
         # Quant
         self.elo_models: dict[str, EloModel] = {sp: EloModel(sp) for sp in DEFAULT_SPORTS}
@@ -124,6 +141,10 @@ class ApexEngine:
         # Background task lifecycle
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
+        # Commands check this before returning data — prevents empty responses
+        # during the ~6s window between process start and first ingest completing.
+        self.startup_complete = False
+        self.startup_started_at: float | None = None
 
     # ------------------------------------------------------------
     # Lifecycle
@@ -136,13 +157,26 @@ class ApexEngine:
         Telegram commands have real data to return within seconds of boot. This is
         important on platforms like Railway where the operator can send commands
         immediately after deploy.
+
+        Sets `self.startup_complete = True` at the end so Telegram handlers can
+        distinguish "no data yet" from "no data ever".
         """
+        import time
+
+        self.startup_started_at = time.monotonic()
         await self.db.connect()
+        # Wire the DB into the cost tracker now that it's open.
+        self.cost_tracker.db = self.db
         # Restore Elo
         for sport, model in self.elo_models.items():
             rows = await self.db.load_elo(sport)
             model.bulk_load(rows)
-        logger.info("engine: core up, bankroll=$%.2f; running initial ingest…", self.state.bankroll)
+        logger.info(
+            "engine: core up, bankroll=$%.2f, claude=%s, sportsdata=%s; running initial ingest…",
+            self.state.bankroll,
+            "on" if self.claude.enabled else "off",
+            "on" if self.sportsdata.enabled else "off",
+        )
 
         # Fire each ingest ONCE on startup, in parallel, so /markets, /predict etc.
         # have data immediately. Any source that fails is logged but does not abort
@@ -158,6 +192,7 @@ class ApexEngine:
         for name, res in zip(initial_jobs.keys(), results):
             if isinstance(res, Exception):
                 logger.warning("initial %s failed: %s", name, res)
+        self.startup_complete = True
         logger.info(
             "engine: initial ingest done — %d markets, %d injuries_sports, %d news, %d elo_teams",
             len(self.markets_by_condition),
@@ -240,6 +275,7 @@ class ApexEngine:
         await self.news.aclose()
         await self.scores.aclose()
         await self.stats.aclose()
+        await self.sportsdata.aclose()
         await self._http.aclose()
         await self.db.close()
 
@@ -400,6 +436,30 @@ class ApexEngine:
         except Exception as exc:  # noqa: BLE001
             logger.warning("forecast failed for %s: %s", market.condition_id, exc)
             return None
+
+        # Optional Claude enrichment — gated on edge threshold AND daily cap.
+        # This keeps the free-tier friendly even in a 500-market universe.
+        if (
+            self.claude.enabled
+            and abs(fc.raw_edge) >= self.settings.anthropic_edge_threshold
+            and market.home_team
+        ):
+            try:
+                team_ctx = await self.sportsdata.team_context(
+                    market.sport.value, market.home_team
+                )
+                claude_est = await self.claude.analyze(
+                    market=market,
+                    ensemble_prob_before=fc.ensemble_prob,
+                    basic_factors=list(fc.key_factors or []),
+                    team_context=team_ctx,
+                    injuries=injuries[:20],
+                )
+                if claude_est is not None:
+                    fc = re_ensemble_with_claude(fc, claude_est)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("claude enrichment failed for %s: %s", market.condition_id, exc)
+
         self.feature_cache.set(key, fc)
         return fc
 

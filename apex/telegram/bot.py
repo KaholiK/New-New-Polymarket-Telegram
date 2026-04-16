@@ -43,6 +43,7 @@ def build_application(engine: ApexEngine, token: str) -> Any:
         "heat",
         "risk",
         "arb",
+        "costs",
         "setstop",
         "pause",
         "resume",

@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     odds_api_key: str = ""
 
+    # --- Optional upgrades (enhanced forecasting) ---
+    anthropic_api_key: str = ""  # enables claude_analyzer model
+    sportsdata_api_key: str = ""  # enables richer player/team stats
+    anthropic_model: str = "claude-sonnet-4-20250514"
+    anthropic_daily_cap_usd: float = 1.0  # stop calling API after this daily spend
+    anthropic_edge_threshold: float = 0.02  # only analyze markets with raw_edge above this
+
     # --- Polymarket (only needed for live mode) ---
     polymarket_private_key: str = ""
     polymarket_api_key: str = ""
@@ -109,6 +116,9 @@ class Settings(BaseSettings):
     @field_validator(
         "telegram_bot_token",
         "odds_api_key",
+        "anthropic_api_key",
+        "sportsdata_api_key",
+        "anthropic_model",
         "polymarket_private_key",
         "polymarket_api_key",
         "polymarket_api_secret",

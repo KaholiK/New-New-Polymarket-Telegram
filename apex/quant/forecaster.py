@@ -246,10 +246,76 @@ class Forecaster:
         return fc
 
 
+def re_ensemble_with_claude(forecast: Forecast, claude_estimate: ModelEstimate) -> Forecast:
+    """Fold a late-arriving Claude estimate into a Forecast and recompute derived fields.
+
+    Called by the engine after `forecaster.forecast()` when the basic ensemble
+    suggested an edge worth Claude's analysis. This mutates and returns the forecast
+    for convenience.
+    """
+    from apex.utils.math_utils import clamp_prob, kelly_from_polymarket, polymarket_edge
+
+    forecast.model_estimates["claude"] = claude_estimate
+    ensemble = combine(forecast.model_estimates)
+    forecast.ensemble_prob = clamp_prob(ensemble.probability)
+    forecast.ensemble_std = ensemble.std
+    forecast.model_disagreement = ensemble.disagreement
+    forecast.confidence = classify_confidence(
+        n_models=len(forecast.model_estimates),
+        disagreement=ensemble.disagreement,
+        edge_zscore=forecast.edge_zscore,
+    )
+
+    # Recompute side + edge from the NEW ensemble probability vs market.
+    yes_price = forecast.market_price if forecast.side == Side.YES else (1.0 - forecast.market_price)
+    # Actually rebase against yes_price from the market; we didn't store the raw market prices
+    # on the Forecast, but market_price for YES side == yes_price. For NO side,
+    # market_price stores the NO price. Use that directly.
+    raw = polymarket_edge(forecast.ensemble_prob, yes_price)
+    if raw >= 0:
+        forecast.side = Side.YES
+        forecast.market_price = yes_price
+        forecast.market_implied_prob = clamp_prob(yes_price)
+        forecast.raw_edge = raw
+    else:
+        forecast.side = Side.NO
+        no_price = 1.0 - yes_price
+        true_no = 1.0 - forecast.ensemble_prob
+        forecast.market_price = no_price
+        forecast.market_implied_prob = clamp_prob(no_price)
+        forecast.raw_edge = true_no - no_price
+    estimated_cost = 0.02
+    forecast.edge_after_costs = forecast.raw_edge - estimated_cost
+    if ensemble.std > 0:
+        forecast.edge_zscore = forecast.raw_edge / max(0.01, ensemble.std)
+    else:
+        forecast.edge_zscore = 0.0
+
+    # Kelly
+    price = forecast.market_price
+    true_prob = forecast.ensemble_prob if forecast.side == Side.YES else 1.0 - forecast.ensemble_prob
+    forecast.kelly_fraction = kelly_from_polymarket(true_prob, price)
+
+    # Add Claude's top factors
+    for f in claude_estimate.factors[:3]:
+        if f not in forecast.key_factors:
+            forecast.key_factors.insert(0, f"🤖 {f}")
+    forecast.key_factors = forecast.key_factors[:5]
+    return forecast
+
+
 def _top_factors(estimates: dict[str, ModelEstimate], limit: int = 5) -> list[str]:
     """Pick the most informative short factors from contributing models."""
     out: list[str] = []
-    priority = ["market_implied", "elo", "power_ratings", "injury", "situational", "poisson"]
+    priority = [
+        "claude",
+        "market_implied",
+        "elo",
+        "power_ratings",
+        "injury",
+        "situational",
+        "poisson",
+    ]
     for name in priority:
         est = estimates.get(name)
         if est is None or not est.factors:

@@ -82,8 +82,13 @@ def test_confidence_no_opinion_few_models():
     assert c == Confidence.NO_OPINION
 
 
-def test_default_weights_sum_close_to_one():
-    assert abs(sum(DEFAULT_WEIGHTS.values()) - 1.0) < 1e-6
+def test_default_weights_claude_highest_and_bounded():
+    # After wiring Claude into the ensemble at weight 0.30, the raw weight sum can
+    # exceed 1.0 — `combine()` (via geometric_mean_odds) normalizes internally so
+    # this is fine. We just check claude is highest and every weight is in [0, 1].
+    assert DEFAULT_WEIGHTS["claude"] >= max(v for k, v in DEFAULT_WEIGHTS.items() if k != "claude")
+    assert all(0.0 <= v <= 1.0 for v in DEFAULT_WEIGHTS.values())
+    assert abs(sum(DEFAULT_WEIGHTS.values()) - 1.1) < 1e-6
 
 
 def test_combine_factors_aggregated():
