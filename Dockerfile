@@ -35,9 +35,6 @@ ENV PATH="/home/apex/.local/bin:${PATH}" \
     PYTHONPATH=/app \
     DB_PATH=/app/data/apex.db
 
-# Volume for persistent bot state (bankroll snapshots, trades, Elo, calibration).
-VOLUME ["/app/data"]
-
 # Sanity check — importing all modules at build time catches breakage early.
 RUN python scripts/smoke.py
 
