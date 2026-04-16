@@ -152,16 +152,18 @@ class CryptoClient:
             fg = await client.get_fear_greed()
     """
 
-    def __init__(self, timeout: float = 15.0) -> None:
-        self._client = httpx.AsyncClient(
+    def __init__(self, client: httpx.AsyncClient | None = None, timeout: float = 15.0) -> None:
+        self._client = client or httpx.AsyncClient(
             timeout=timeout,
             headers={"User-Agent": "APEX/0.1"},
             follow_redirects=True,
         )
+        self._owns_client = client is None
         self._cache = _TTLCache()
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        if self._owns_client:
+            await self._client.aclose()
 
     async def __aenter__(self) -> CryptoClient:
         return self
