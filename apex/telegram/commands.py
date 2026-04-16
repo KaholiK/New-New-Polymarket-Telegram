@@ -10,6 +10,7 @@ The Telegram wiring (bot.py) attaches these as CommandHandlers.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any
 
 from apex.telegram.auth import is_authorized
@@ -18,7 +19,6 @@ from apex.telegram.formatters import (
     format_help,
     format_pnl,
     format_positions,
-    format_status,
 )
 from apex.telegram.keyboards import confirm_keyboard, parse_callback
 from apex.utils.logger import get_logger
@@ -68,6 +68,48 @@ def detect_category_for(market: Any) -> Any:
     return detect_category(market.question or "", event_title=None, tags=market.tags if hasattr(market, "tags") else None)
 
 
+_PRICE_TARGET_RE = re.compile(
+    r"\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(k|K|m|M)?",
+)
+
+
+def _extract_target_from_title(title: str) -> float | None:
+    """Parse a price target from a crypto market title.
+
+    Examples::
+        "Will BTC hit $110,000 by June?"   → 110_000
+        "ETH above $4K by Q3?"              → 4000
+        "SOL reach 200 by end of year"      → 200
+
+    Returns the first plausible price-looking match, or None.
+    """
+    if not title:
+        return None
+    # Skip tokens that look like years (prevents "2025" from being picked up).
+    best: float | None = None
+    for m in _PRICE_TARGET_RE.finditer(title):
+        num_str, suffix = m.group(1), (m.group(2) or "").lower()
+        try:
+            val = float(num_str.replace(",", ""))
+        except ValueError:
+            continue
+        if suffix == "k":
+            val *= 1_000.0
+        elif suffix == "m":
+            val *= 1_000_000.0
+        # Reject obvious year matches (1900-2100, no suffix, no $ prefix).
+        start = m.start()
+        had_dollar = title[max(0, start - 2):start].strip().endswith("$")
+        if not had_dollar and not suffix and 1900 <= val <= 2100 and val == int(val):
+            continue
+        if val < 0.0001 or val > 10_000_000:
+            continue
+        # Keep the LARGEST plausible target — "100K" beats "2026".
+        if best is None or val > best:
+            best = val
+    return best
+
+
 def make_handlers(engine: ApexEngine) -> dict[str, Any]:
     """Return dict of command_name → async handler closure bound to engine."""
 
@@ -85,10 +127,17 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         await update.message.reply_text(format_help(), parse_mode="HTML")
 
     async def status(update: Any, ctx: Any) -> None:
+        """Enhanced health dashboard — shows every integration's state + bankroll."""
         if not await _auth_or_reject(update):
             return
+        from apex.telegram.crypto_formatters import format_system_status
+        from apex.telegram.formatters import esc
+
         snap = engine.state.snapshot()
-        await update.message.reply_text(format_status(snap), parse_mode="HTML")
+        await update.message.reply_text(
+            format_system_status(engine=engine, bot_snapshot=snap, esc=esc),
+            parse_mode="HTML",
+        )
 
     async def health(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
@@ -599,39 +648,277 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         if not await _wait_for_startup(engine, update):
             return
         from apex.market.categories import Category
+        from apex.telegram.crypto_formatters import format_crypto_dashboard
         from apex.telegram.formatters import esc
+
         crypto_markets = [m for m in engine.markets_by_condition.values()
                          if detect_category_for(m) == Category.CRYPTO]
-        if not crypto_markets:
-            await update.message.reply_text("No crypto markets found. Try /scan first.")
-            return
         crypto_markets.sort(key=lambda m: m.volume, reverse=True)
-        lines = [f"<b>Crypto Markets</b> ({len(crypto_markets)})"]
-        for m in crypto_markets[:15]:
-            lines.append(f"  ${m.volume:,.0f} YES={m.yes_price:.3f} {esc(m.question[:65])}")
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        await update.message.reply_text(
+            format_crypto_dashboard(
+                state=engine.crypto_state,
+                service_status=engine.service_status,
+                markets=crypto_markets[:5],
+                esc=esc,
+            ),
+            parse_mode="HTML",
+        )
 
     async def predict_crypto(update: Any, ctx: Any) -> None:
+        """Crypto ensemble prediction.
+
+        Usage: /predict_crypto <COIN> [timeframe_hours]
+        Defaults: coin=btc, timeframe=24.
+        If a matching Polymarket YES/NO exists, shows edge & recommendation.
+        """
         if not await _auth_or_reject(update):
             return
         if not await _wait_for_startup(engine, update):
             return
         args = ctx.args if getattr(ctx, "args", None) else []
-        asset = args[0].lower() if args else "btc"
-        # Find best crypto market matching the asset
-        from apex.market.categories import Category
-        crypto_markets = [m for m in engine.markets_by_condition.values()
-                         if detect_category_for(m) == Category.CRYPTO
-                         and asset in (m.question or "").lower()]
-        if not crypto_markets:
-            await update.message.reply_text(f"No crypto market for '{asset}'. Try /crypto to see available.")
+        asset = (args[0] if args else "btc").lower().strip()
+        try:
+            timeframe_hours = float(args[1]) if len(args) > 1 else 24.0
+        except ValueError:
+            timeframe_hours = 24.0
+
+        snap = engine.crypto_state.get_price(asset)
+        if snap is None or snap.price_usd <= 0:
+            # On-demand fetch so the user isn't blocked behind the schedule.
+            try:
+                data = await engine.crypto_client.get_price(asset)
+            except Exception:  # noqa: BLE001
+                data = None
+            if data:
+                engine.crypto_state.update_price(asset, data)
+                snap = engine.crypto_state.get_price(asset)
+        if snap is None or snap.price_usd <= 0:
+            await update.message.reply_text(
+                f"No price data for '{asset}'. Try BTC, ETH, SOL, ADA, AVAX, LINK, DOT, MATIC, DOGE."
+            )
             return
-        best = max(crypto_markets, key=lambda m: m.volume)
-        fc = await engine._forecast_market(best)  # noqa: SLF001
-        if fc:
-            await update.message.reply_text(format_forecast(fc), parse_mode="HTML")
-        else:
-            await update.message.reply_text("Forecast failed.")
+
+        # Find a matching Polymarket market (e.g., "Will BTC hit $110K by June?").
+        from apex.market.categories import Category
+
+        crypto_markets = [
+            m for m in engine.markets_by_condition.values()
+            if detect_category_for(m) == Category.CRYPTO
+            and asset in (m.question or "").lower()
+        ]
+        best_market = max(crypto_markets, key=lambda m: m.volume) if crypto_markets else None
+
+        target_price = snap.price_usd * 1.05  # default 5% upside if no market parse
+        market_yes_price: float | None = None
+        if best_market is not None:
+            market_yes_price = best_market.yes_price
+            parsed = _extract_target_from_title(best_market.question or "")
+            if parsed is not None:
+                target_price = parsed
+
+        klines = engine.crypto_state.get_klines(asset, "1h")
+        if not klines:
+            # Fallback: try 4h klines.
+            klines = engine.crypto_state.get_klines(asset, "4h")
+        if not klines:
+            try:
+                klines = await engine.crypto_client.get_klines(asset, interval="1h", limit=200)
+                if klines:
+                    engine.crypto_state.update_klines(asset, "1h", klines)
+            except Exception:  # noqa: BLE001
+                klines = []
+
+        from apex.quant.crypto_ensemble import predict as ensemble_predict
+        from apex.telegram.crypto_formatters import format_crypto_prediction
+
+        result = ensemble_predict(
+            asset=asset,
+            timeframe_hours=timeframe_hours,
+            klines=klines,
+            current_price=snap.price_usd,
+            target_price=target_price,
+            fear_greed=engine.crypto_state.get_fear_greed_value(),
+        )
+        await update.message.reply_text(
+            format_crypto_prediction(
+                result=result,
+                snap=snap,
+                market=best_market,
+                market_yes_price=market_yes_price,
+                fear_greed=engine.crypto_state.fear_greed,
+            ),
+            parse_mode="HTML",
+        )
+
+    # ---- Alerts / Portfolio / Watchlist ----
+
+    async def alerts_cmd(update: Any, ctx: Any) -> None:
+        """/alerts set|list|clear — manage price alerts."""
+        if not await _auth_or_reject(update):
+            return
+        from apex.telegram.formatters import esc
+
+        args = ctx.args if getattr(ctx, "args", None) else []
+        user_id = update.effective_user.id if getattr(update, "effective_user", None) else 0
+        sub = (args[0].lower() if args else "list").strip()
+        uf = engine.user_features
+
+        if sub == "set":
+            if len(args) < 4:
+                await update.message.reply_text(
+                    "Usage: <code>/alerts set &lt;COIN&gt; &lt;above|below&gt; &lt;price&gt;</code>",
+                    parse_mode="HTML",
+                )
+                return
+            try:
+                target = float(args[3].replace(",", "").replace("$", ""))
+            except ValueError:
+                await update.message.reply_text("Price must be a number.")
+                return
+            ok, msg = await uf.add_alert(user_id, args[1], args[2], target)
+            await update.message.reply_text(("🔔 " if ok else "❌ ") + esc(msg))
+            return
+
+        if sub == "clear":
+            n = await uf.clear_alerts(user_id)
+            await update.message.reply_text(f"🧹 Cleared {n} alerts.")
+            return
+
+        # Default: list
+        rows = await uf.list_alerts(user_id)
+        if not rows:
+            await update.message.reply_text("No active alerts. Set one: /alerts set BTC above 110000")
+            return
+        lines = ["<b>🔔 Your Alerts</b>"]
+        for i, r in enumerate(rows, 1):
+            snap = engine.crypto_state.get_price(r["coin"])
+            if snap is not None:
+                dist = (r["target_price"] - snap.price_usd) / snap.price_usd
+                now_str = f" (now ${snap.price_usd:,.2f}, {dist:+.1%} away)"
+            else:
+                now_str = ""
+            lines.append(
+                f"  {i}. {esc(r['coin'].upper())} {esc(r['direction'])} "
+                f"${r['target_price']:,.2f}{now_str}"
+            )
+        lines.append("")
+        lines.append("/alerts set &lt;COIN&gt; &lt;above|below&gt; &lt;price&gt; · /alerts clear")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def portfolio_cmd(update: Any, ctx: Any) -> None:
+        """/portfolio [COIN amount] — virtual portfolio tracker."""
+        if not await _auth_or_reject(update):
+            return
+        from apex.telegram.formatters import esc
+
+        args = ctx.args if getattr(ctx, "args", None) else []
+        user_id = update.effective_user.id if getattr(update, "effective_user", None) else 0
+        uf = engine.user_features
+
+        if len(args) >= 2:
+            coin = args[0].lower()
+            try:
+                amount = float(args[1])
+            except ValueError:
+                await update.message.reply_text("Amount must be a number, e.g. 0.5")
+                return
+            if amount == 0:
+                n = await uf.remove_holding(user_id, coin)
+                await update.message.reply_text(
+                    f"Removed {coin.upper()} from portfolio." if n else "Not in portfolio."
+                )
+                return
+            snap = engine.crypto_state.get_price(coin)
+            entry = snap.price_usd if snap else 0.0
+            if entry <= 0:
+                try:
+                    data = await engine.crypto_client.get_price(coin)
+                    if data and data.get("price_usd"):
+                        entry = float(data["price_usd"])
+                        engine.crypto_state.update_price(coin, data)
+                except Exception:  # noqa: BLE001
+                    entry = 0.0
+            if entry <= 0:
+                await update.message.reply_text(f"Couldn't get a price for {coin.upper()}.")
+                return
+            await uf.upsert_holding(user_id, coin, amount, entry)
+            await update.message.reply_text(
+                f"💼 Holding set: {amount:g} {coin.upper()} @ ${entry:,.2f}"
+            )
+            return
+
+        # Show portfolio
+        rows = await uf.list_portfolio(user_id)
+        if not rows:
+            await update.message.reply_text(
+                "💼 Empty portfolio. Add one: /portfolio BTC 0.5"
+            )
+            return
+        lines = ["<b>💼 Your Portfolio</b>"]
+        total_value = 0.0
+        total_cost = 0.0
+        for r in rows:
+            coin = r["coin"]
+            amt = float(r["amount"])
+            entry = float(r["entry_price"])
+            snap = engine.crypto_state.get_price(coin)
+            cur_price = snap.price_usd if snap else entry
+            value = amt * cur_price
+            cost = amt * entry
+            pnl_pct = (cur_price - entry) / entry if entry else 0.0
+            total_value += value
+            total_cost += cost
+            lines.append(
+                f"  {amt:g} {esc(coin.upper())} — ${value:,.2f} "
+                f"({pnl_pct:+.1%} since entry at ${entry:,.2f})"
+            )
+        pnl = total_value - total_cost
+        pnl_pct = (pnl / total_cost) if total_cost else 0.0
+        lines.append("")
+        lines.append(
+            f"Total: ${total_value:,.2f} · P&amp;L: ${pnl:+,.2f} ({pnl_pct:+.1%})"
+        )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def watchlist_cmd(update: Any, ctx: Any) -> None:
+        """/watchlist [add|remove] [COIN] — per-user price watchlist."""
+        if not await _auth_or_reject(update):
+            return
+        from apex.telegram.formatters import esc
+
+        args = ctx.args if getattr(ctx, "args", None) else []
+        user_id = update.effective_user.id if getattr(update, "effective_user", None) else 0
+        uf = engine.user_features
+
+        if args and args[0].lower() == "add" and len(args) >= 2:
+            ok = await uf.watchlist_add(user_id, args[1])
+            await update.message.reply_text(
+                f"👁 Added {args[1].upper()} to watchlist." if ok
+                else f"{args[1].upper()} already in watchlist."
+            )
+            return
+        if args and args[0].lower() == "remove" and len(args) >= 2:
+            n = await uf.watchlist_remove(user_id, args[1])
+            await update.message.reply_text(
+                f"Removed {args[1].upper()}." if n else "Not in watchlist."
+            )
+            return
+
+        coins = await uf.watchlist_list(user_id)
+        if not coins:
+            await update.message.reply_text(
+                "👁 Empty watchlist. Add one: /watchlist add BTC"
+            )
+            return
+        lines = ["<b>👁 Your Watchlist</b>"]
+        for c in coins:
+            snap = engine.crypto_state.get_price(c)
+            if snap is not None:
+                chg = f" ({snap.change_24h_pct:+.2f}% 24h)" if snap.change_24h_pct is not None else ""
+                lines.append(f"  {esc(c.upper())}: ${snap.price_usd:,.2f}{chg}")
+            else:
+                lines.append(f"  {esc(c.upper())}: (no price)")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def claude_score(update: Any, ctx: Any) -> None:
         """Get on-demand Claude deep analysis with 1-10 score."""
@@ -808,9 +1095,29 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         )
 
     async def smoke(update: Any, ctx: Any) -> None:
+        """Quick health ping — degraded services inline."""
         if not await _auth_or_reject(update):
             return
-        await update.message.reply_text("Smoke test: see scripts/smoke.py")
+        ss = engine.service_status
+        degraded = []
+        if not ss.db_healthy:
+            degraded.append("DB")
+        if ss.odds_api_degraded:
+            degraded.append(f"Odds API ({ss.odds_api_reason or 'unknown'})")
+        if ss.coingecko_degraded:
+            degraded.append("CoinGecko")
+        if ss.binance_degraded:
+            degraded.append("Binance")
+        if ss.fear_greed_degraded:
+            degraded.append("Fear & Greed")
+        if ss.polymarket_degraded:
+            degraded.append("Polymarket")
+        if not degraded:
+            await update.message.reply_text("✅ All systems nominal. /status for details.")
+        else:
+            await update.message.reply_text(
+                "⚠️ Degraded: " + ", ".join(degraded) + ". /status for details."
+            )
 
     async def callback_query(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
@@ -865,6 +1172,9 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         "autopilot": autopilot_cmd,
         "crypto": crypto,
         "predict_crypto": predict_crypto,
+        "alerts": alerts_cmd,
+        "portfolio": portfolio_cmd,
+        "watchlist": watchlist_cmd,
         "claude_score": claude_score,
         "performance": performance,
         "best_setups": best_setups,

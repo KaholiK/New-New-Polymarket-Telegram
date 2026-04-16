@@ -90,6 +90,8 @@ class Settings(BaseSettings):
 
     # --- Telegram ---
     telegram_authorized_users: str = ""  # comma-separated numeric user IDs
+    admin_chat_id: int = 0  # chat ID for operational alerts (0 disables)
+    admin_alert_throttle_seconds: float = 30 * 60  # min gap between same-key alerts
 
     # --- Mapping ---
     min_mapping_confidence: float = 0.70

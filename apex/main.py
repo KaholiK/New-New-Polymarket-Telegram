@@ -34,6 +34,11 @@ async def main_async() -> None:
             await app.initialize()
             await app.start()
             await app.updater.start_polling()
+            # Wire the admin notifier to the live bot so alerts can reach Telegram.
+            try:
+                engine.notifier.attach_bot(app.bot)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("notifier.attach_bot failed: %s", exc)
             logger.info("telegram polling running")
         except Exception as exc:  # noqa: BLE001
             logger.error("telegram init failed (%s); continuing without bot", exc)
