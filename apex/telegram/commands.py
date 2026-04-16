@@ -82,7 +82,13 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
     async def help_cmd(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
             return
-        await update.message.reply_text(format_help(), parse_mode="HTML")
+        await update.message.reply_text(
+            format_help(
+                dry_run=engine.state.dry_run,
+                engine_online=getattr(engine, "startup_complete", False),
+            ),
+            parse_mode="HTML",
+        )
 
     async def status(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
@@ -603,12 +609,20 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         crypto_markets = [m for m in engine.markets_by_condition.values()
                          if detect_category_for(m) == Category.CRYPTO]
         if not crypto_markets:
-            await update.message.reply_text("No crypto markets found. Try /scan first.")
+            await update.message.reply_text(
+                "No crypto markets in cache. Try /scan to discover markets."
+            )
             return
         crypto_markets.sort(key=lambda m: m.volume, reverse=True)
-        lines = [f"<b>Crypto Markets</b> ({len(crypto_markets)})"]
-        for m in crypto_markets[:15]:
-            lines.append(f"  ${m.volume:,.0f} YES={m.yes_price:.3f} {esc(m.question[:65])}")
+        lines = [f"<b>🔐 Crypto Markets</b> ({len(crypto_markets)} found, top 10 by volume)\n"]
+        for m in crypto_markets[:10]:
+            yes = m.yes_price
+            no = m.no_price if m.no_price else round(1.0 - yes, 3)
+            indicator = "🟢" if yes > 0.5 else "🔴"
+            lines.append(
+                f"{indicator} YES={yes:.3f} NO={no:.3f} · vol ${m.volume:,.0f}\n"
+                f"   {esc(m.question[:70])}"
+            )
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def predict_crypto(update: Any, ctx: Any) -> None:
@@ -616,22 +630,121 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
             return
         if not await _wait_for_startup(engine, update):
             return
+        import re
+
+        from apex.market.categories import Category
+        from apex.quant.crypto_ensemble import predict as crypto_predict
+        from apex.telegram.formatters import esc
+
         args = ctx.args if getattr(ctx, "args", None) else []
         asset = args[0].lower() if args else "btc"
-        # Find best crypto market matching the asset
-        from apex.market.categories import Category
-        crypto_markets = [m for m in engine.markets_by_condition.values()
-                         if detect_category_for(m) == Category.CRYPTO
-                         and asset in (m.question or "").lower()]
+        timeframe_arg = args[1].lower() if len(args) > 1 else "24h"
+
+        # Parse timeframe to hours
+        def _parse_tf_hours(s: str) -> float:
+            s = s.strip().lower()
+            if s.endswith("d"):
+                return float(s[:-1]) * 24
+            if s.endswith("h"):
+                return float(s[:-1])
+            if s.endswith("m"):
+                return float(s[:-1]) / 60
+            return 24.0
+
+        try:
+            tf_hours = _parse_tf_hours(timeframe_arg)
+        except ValueError:
+            tf_hours = 24.0
+
+        # Find the best matching crypto market
+        crypto_markets = [
+            m for m in engine.markets_by_condition.values()
+            if detect_category_for(m) == Category.CRYPTO
+            and asset in (m.question or "").lower()
+        ]
         if not crypto_markets:
-            await update.message.reply_text(f"No crypto market for '{asset}'. Try /crypto to see available.")
+            await update.message.reply_text(
+                f"No crypto market found for '<code>{esc(asset)}</code>'. "
+                "Try /crypto to see available markets.",
+                parse_mode="HTML",
+            )
             return
-        best = max(crypto_markets, key=lambda m: m.volume)
-        fc = await engine._forecast_market(best)  # noqa: SLF001
-        if fc:
-            await update.message.reply_text(format_forecast(fc), parse_mode="HTML")
+        market = max(crypto_markets, key=lambda m: m.volume)
+
+        # Extract target price from the question (e.g. "Will BTC hit $100,000?")
+        price_match = re.search(r"\$([0-9][0-9,]*(?:\.[0-9]+)?)\s*[kK]?", market.question or "")
+        if price_match:
+            raw = price_match.group(1).replace(",", "")
+            multiplier = 1000.0 if market.question and "k" in market.question[price_match.end()-1:price_match.end()+1].lower() else 1.0
+            target_price = float(raw) * multiplier
         else:
-            await update.message.reply_text("Forecast failed.")
+            target_price = 0.0  # unknown; models will use relative positioning
+
+        # Fetch live crypto data
+        await update.message.reply_text(f"🔄 Fetching data for {asset.upper()}…")
+        price_data: dict = {}
+        klines: list = []
+        fear_greed_val = 50
+        try:
+            price_data = await engine.crypto_client.get_price(asset)
+            klines = await engine.crypto_client.get_klines(asset, interval="1h", limit=100)
+            fg = await engine.crypto_client.get_fear_greed()
+            fear_greed_val = fg.get("value", 50) if fg else 50
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("predict_crypto: data fetch failed: %s", exc)
+
+        current_price = price_data.get("price_usd") or 0.0
+        change_24h = price_data.get("change_24h_pct")
+
+        # If we couldn't determine target price, use +5% as a placeholder
+        if target_price == 0.0 and current_price > 0:
+            target_price = current_price * 1.05
+
+        # Run the crypto ensemble
+        result = crypto_predict(
+            asset=asset.upper(),
+            timeframe_hours=tf_hours,
+            klines=klines,
+            current_price=current_price,
+            target_price=target_price,
+            fear_greed=fear_greed_val,
+        )
+
+        prob = result["ensemble_prob"]
+        std = result["ensemble_std"]
+        confidence = result["confidence"]
+        edge = prob - market.yes_price
+        side = "YES" if edge > 0 else "NO"
+        edge_pct = abs(edge) * 100
+
+        lines = [
+            f"🔮 <b>Crypto Forecast: {asset.upper()}</b> ({timeframe_arg})",
+            "",
+            f"❓ <b>Market:</b> {esc(market.question[:80])}",
+            f"💲 <b>Current Price:</b> ${current_price:,.2f}"
+            + (f" ({change_24h:+.1f}% 24h)" if change_24h is not None else ""),
+            f"🎯 <b>Target Price:</b> ${target_price:,.2f}",
+            "",
+            f"📊 <b>Model Probability:</b> {prob:.3f} ± {std:.3f}",
+            f"💰 <b>Market YES Price:</b> {market.yes_price:.3f}",
+            f"📈 <b>Edge:</b> {edge:+.3f} ({edge_pct:.1f}%)",
+            f"🎯 <b>Confidence:</b> {esc(str(confidence.value))}",
+            f"⚡ <b>Side:</b> {side}",
+            f"😱 <b>Fear &amp; Greed:</b> {fear_greed_val}/100",
+            "",
+            "<b>Model Breakdown:</b>",
+        ]
+        for name, est in result["model_estimates"].items():
+            w = result["weights"].get(name, 0)
+            short_name = name.replace("crypto_", "")
+            lines.append(f"  {esc(short_name):12} {est.probability:.3f}  (w={w:.2f})")
+        if result.get("key_factors"):
+            lines.append("")
+            lines.append("<b>Key Factors:</b>")
+            for kf in result["key_factors"][:4]:
+                lines.append(f"  • {esc(kf)}")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def claude_score(update: Any, ctx: Any) -> None:
         """Get on-demand Claude deep analysis with 1-10 score."""
@@ -810,7 +923,63 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
     async def smoke(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
             return
-        await update.message.reply_text("Smoke test: see scripts/smoke.py")
+        await update.message.reply_text("🔬 Running self-test…")
+        results: list[str] = []
+
+        # 1. DB connection
+        try:
+            db_ok = engine.health.db_healthy
+        except Exception:  # noqa: BLE001
+            db_ok = False
+        results.append(f"{'✅' if db_ok else '❌'} Database connection")
+
+        # 2. Polymarket API (markets in cache)
+        market_count = len(engine.markets_by_condition)
+        pm_ok = market_count > 0
+        results.append(f"{'✅' if pm_ok else '⚠️'} Polymarket ({market_count} markets cached)")
+
+        # 3. Crypto market discoverable
+        try:
+            from apex.market.categories import Category
+            crypto_count = sum(
+                1 for m in engine.markets_by_condition.values()
+                if detect_category_for(m) == Category.CRYPTO
+            )
+        except Exception:  # noqa: BLE001
+            crypto_count = 0
+        crypto_ok = crypto_count > 0
+        results.append(f"{'✅' if crypto_ok else '⚠️'} Crypto markets ({crypto_count} discovered)")
+
+        # 4. CryptoClient live ping (BTC price)
+        try:
+            price_data = await engine.crypto_client.get_price("btc")
+            btc_price = price_data.get("price_usd", 0) if price_data else 0
+            crypto_api_ok = btc_price > 0
+        except Exception:  # noqa: BLE001
+            crypto_api_ok = False
+            btc_price = 0
+        results.append(
+            f"{'✅' if crypto_api_ok else '❌'} CoinGecko API"
+            + (f" (BTC=${btc_price:,.0f})" if crypto_api_ok else "")
+        )
+
+        # 5. Telegram (if we got this far, polling is alive)
+        results.append("✅ Telegram polling (this message proves it)")
+
+        # 6. Startup complete
+        started = getattr(engine, "startup_complete", False)
+        results.append(f"{'✅' if started else '⏳'} Startup sequence {'complete' if started else 'in progress'}")
+
+        # 7. Tasks running
+        running = sum(1 for t in engine._tasks if not t.done())  # noqa: SLF001
+        total = len(engine._tasks)  # noqa: SLF001
+        tasks_ok = running == total
+        results.append(f"{'✅' if tasks_ok else '⚠️'} Background tasks ({running}/{total} running)")
+
+        all_ok = all(r.startswith("✅") for r in results)
+        header = "✅ <b>All systems go</b>" if all_ok else "⚠️ <b>Smoke test — some checks failed</b>"
+        text = header + "\n\n" + "\n".join(results)
+        await update.message.reply_text(text, parse_mode="HTML")
 
     async def callback_query(update: Any, ctx: Any) -> None:
         if not await _auth_or_reject(update):
