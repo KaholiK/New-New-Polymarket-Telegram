@@ -6,6 +6,7 @@ Tables use plain columns, not ORMs — schema is small and explicit.
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from typing import Any
 
@@ -194,7 +195,24 @@ class Database:
 
     async def connect(self) -> None:
         if self._conn is None:
-            self._conn = await aiosqlite.connect(self.path)
+            # Ensure parent directory exists (critical for Railway volume mounts)
+            db_dir = os.path.dirname(os.path.abspath(self.path))
+            try:
+                os.makedirs(db_dir, exist_ok=True)
+            except OSError as exc:
+                logger.error(
+                    "db: cannot create directory %s: %s", db_dir, exc, exc_info=True,
+                )
+                raise
+
+            logger.info("db: opening %s (resolved: %s)", self.path, os.path.abspath(self.path))
+            try:
+                self._conn = await aiosqlite.connect(self.path)
+            except Exception as exc:
+                logger.error(
+                    "db: unable to open database file at %s: %s", os.path.abspath(self.path), exc, exc_info=True,
+                )
+                raise
             self._conn.row_factory = aiosqlite.Row
             await self._conn.execute("PRAGMA journal_mode=WAL")
             await self._conn.execute("PRAGMA foreign_keys=ON")

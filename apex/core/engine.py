@@ -196,7 +196,7 @@ class ApexEngine:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("elo restore %s failed: %s", sport, exc)
         except Exception as exc:  # noqa: BLE001
-            logger.error("db/elo init failed: %s — continuing without persistence", exc)
+            logger.error("db/elo init failed: %s — continuing without persistence", exc, exc_info=True)
 
         logger.info(
             "engine: core up, bankroll=$%.2f, claude=%s, sportsdata=%s; running initial ingest…",
