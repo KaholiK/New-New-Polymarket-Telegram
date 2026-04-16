@@ -102,6 +102,29 @@ class ApexEngine:
             cost_tracker=self.cost_tracker,
         )
 
+        # Claude Deep Analyzer — mandatory 1-10 score before every trade
+        from apex.quant.models.claude_deep_analyzer import ClaudeDeepAnalyzer
+
+        self.claude_deep = ClaudeDeepAnalyzer(
+            api_key=self.settings.anthropic_api_key,
+            model=self.settings.anthropic_model,
+            cost_tracker=self.cost_tracker,
+        )
+
+        # Crypto data client
+        from apex.data.crypto_client import CryptoClient
+
+        self.crypto_client = CryptoClient(client=self._http)
+
+        # Trading mode + autopilot + performance
+        from apex.core.autopilot import Autopilot
+        from apex.core.performance_tracker import PerformanceTracker
+        from apex.core.trading_modes import TradingMode
+
+        self.trading_mode = TradingMode.BALANCED
+        self.performance = PerformanceTracker()
+        self.autopilot = Autopilot(self)
+
         # Quant
         self.elo_models: dict[str, EloModel] = {sp: EloModel(sp) for sp in DEFAULT_SPORTS}
         self.power_models: dict[str, PowerRatingsModel] = {

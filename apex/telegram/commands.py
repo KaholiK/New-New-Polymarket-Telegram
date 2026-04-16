@@ -62,6 +62,12 @@ async def _wait_for_startup(engine: Any, update: Any) -> bool:
     return False
 
 
+def detect_category_for(market: Any) -> Any:
+    """Helper for category detection from a Market object."""
+    from apex.market.categories import detect_category
+    return detect_category(market.question or "", event_title=None, tags=market.tags if hasattr(market, "tags") else None)
+
+
 def make_handlers(engine: ApexEngine) -> dict[str, Any]:
     """Return dict of command_name → async handler closure bound to engine."""
 
@@ -516,6 +522,217 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
             lines.append("⚠️ Claude disabled (no ANTHROPIC_API_KEY or SDK init failed).")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
+    # ---- Trading Modes ----
+
+    async def mode_cmd(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        from apex.core.trading_modes import TradingMode, format_modes_list, get_mode_rules
+
+        args = ctx.args if getattr(ctx, "args", None) else []
+        if not args:
+            await update.message.reply_text(format_modes_list(engine.trading_mode), parse_mode="HTML")
+            return
+        name = args[0].lower()
+        try:
+            new_mode = TradingMode(name)
+        except ValueError:
+            await update.message.reply_text(f"Unknown mode '{name}'. Try /mode to see all modes.")
+            return
+        rules = get_mode_rules(new_mode)
+        if rules.warning:
+            await update.message.reply_text(
+                f"⚠️ {rules.warning}\nConfirm switch to {rules.name}?",
+                reply_markup=confirm_keyboard("mode", name),
+            )
+        else:
+            engine.trading_mode = new_mode
+            engine.autopilot.mode = new_mode
+            await update.message.reply_text(f"✅ Mode switched to <b>{rules.name}</b>", parse_mode="HTML")
+
+    async def modes(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        from apex.core.trading_modes import format_modes_list
+        await update.message.reply_text(format_modes_list(engine.trading_mode), parse_mode="HTML")
+
+    async def current_mode(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        from apex.core.trading_modes import get_mode_rules
+        from apex.telegram.formatters import esc
+        r = get_mode_rules(engine.trading_mode)
+        await update.message.reply_text(
+            f"<b>Current Mode: {esc(r.name)}</b>\n"
+            f"{esc(r.description)}\n"
+            f"Edge ≥ {r.min_edge_zscore} · Claude ≥ {r.min_claude_score}/10\n"
+            f"Expected: ~{r.expected_trades_per_day}/day · WR: {r.target_win_rate}",
+            parse_mode="HTML",
+        )
+
+    # ---- Autopilot ----
+
+    async def autopilot_cmd(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        args = ctx.args if getattr(ctx, "args", None) else []
+        if not args:
+            await update.message.reply_text(engine.autopilot.status_text(), parse_mode="HTML")
+            return
+        action = args[0].lower()
+        if action == "on":
+            engine.autopilot.start()
+            await update.message.reply_text("🟢 Autopilot ON — autonomous trading started.")
+        elif action == "off":
+            engine.autopilot.stop()
+            await update.message.reply_text("🔴 Autopilot OFF — autonomous trading stopped.")
+        elif action == "status":
+            await update.message.reply_text(engine.autopilot.status_text(), parse_mode="HTML")
+        else:
+            await update.message.reply_text("Usage: /autopilot on|off|status")
+
+    # ---- Crypto ----
+
+    async def crypto(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        if not await _wait_for_startup(engine, update):
+            return
+        from apex.market.categories import Category
+        from apex.telegram.formatters import esc
+        crypto_markets = [m for m in engine.markets_by_condition.values()
+                         if detect_category_for(m) == Category.CRYPTO]
+        if not crypto_markets:
+            await update.message.reply_text("No crypto markets found. Try /scan first.")
+            return
+        crypto_markets.sort(key=lambda m: m.volume, reverse=True)
+        lines = [f"<b>Crypto Markets</b> ({len(crypto_markets)})"]
+        for m in crypto_markets[:15]:
+            lines.append(f"  ${m.volume:,.0f} YES={m.yes_price:.3f} {esc(m.question[:65])}")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def predict_crypto(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        if not await _wait_for_startup(engine, update):
+            return
+        args = ctx.args if getattr(ctx, "args", None) else []
+        asset = args[0].lower() if args else "btc"
+        # Find best crypto market matching the asset
+        from apex.market.categories import Category
+        crypto_markets = [m for m in engine.markets_by_condition.values()
+                         if detect_category_for(m) == Category.CRYPTO
+                         and asset in (m.question or "").lower()]
+        if not crypto_markets:
+            await update.message.reply_text(f"No crypto market for '{asset}'. Try /crypto to see available.")
+            return
+        best = max(crypto_markets, key=lambda m: m.volume)
+        fc = await engine._forecast_market(best)  # noqa: SLF001
+        if fc:
+            await update.message.reply_text(format_forecast(fc), parse_mode="HTML")
+        else:
+            await update.message.reply_text("Forecast failed.")
+
+    async def claude_score(update: Any, ctx: Any) -> None:
+        """Get on-demand Claude deep analysis with 1-10 score."""
+        if not await _auth_or_reject(update):
+            return
+        if not await _wait_for_startup(engine, update):
+            return
+        args = ctx.args if getattr(ctx, "args", None) else []
+        query = " ".join(args) if args else ""
+        if not query:
+            await update.message.reply_text("Usage: /claude_score <market query or condition_id>")
+            return
+        fc = await engine.predict_by_query(query)
+        if not fc:
+            await update.message.reply_text(f"No market found for '{query}'")
+            return
+        market = engine.markets_by_condition.get(fc.market_id)
+        if not market:
+            await update.message.reply_text("Market not in cache.")
+            return
+        if not engine.claude_deep or not engine.claude_deep.enabled:
+            await update.message.reply_text("Claude API not configured (no ANTHROPIC_API_KEY).")
+            return
+        await update.message.reply_text("🤖 Running Claude deep analysis…")
+        from apex.core.autopilot import _build_context
+        context = _build_context(engine, market)
+        result = await engine.claude_deep.analyze(market, fc, context)
+        if result is None:
+            await update.message.reply_text("Claude analysis failed or daily cap hit.")
+            return
+        from apex.telegram.formatters import esc
+        lines = [
+            f"🤖 <b>Claude Deep Analysis</b>: {esc(market.question[:60])}",
+            f"Score: <b>{result['score']}/10</b>",
+            f"Probability: {result.get('probability', 0.5):.3f}",
+            f"Confidence: {esc(str(result.get('confidence', '?')))}",
+            f"Size multiplier: {result.get('recommended_size_multiplier', 1.0):.1f}x",
+            "",
+            f"<b>Reasoning</b>: {esc(str(result.get('reasoning', ''))[:200])}",
+        ]
+        factors_for = result.get("key_factors_for", [])
+        if factors_for:
+            lines.append("\n<b>For</b>:")
+            for f in factors_for[:5]:
+                lines.append(f"  ✅ {esc(str(f))}")
+        factors_against = result.get("key_factors_against", [])
+        if factors_against:
+            lines.append("<b>Against</b>:")
+            for f in factors_against[:5]:
+                lines.append(f"  ❌ {esc(str(f))}")
+        warnings = result.get("warnings", [])
+        if warnings:
+            lines.append("<b>Warnings</b>:")
+            for w in warnings:
+                lines.append(f"  ⚠️ {esc(str(w))}")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    # ---- Performance ----
+
+    async def performance(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        from apex.telegram.formatters import esc
+        summary = engine.performance.mode_summary()
+        if not summary:
+            await update.message.reply_text("No performance data yet — start trading first.")
+            return
+        lines = ["<b>Performance by Mode</b>"]
+        for mode_name, stats in summary.items():
+            lines.append(
+                f"  <b>{esc(mode_name)}</b>: {stats['trades']} trades · "
+                f"WR {stats['win_rate']} · P&L {stats['pnl']} · CLV {stats['avg_clv']}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def best_setups(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        from apex.telegram.formatters import esc
+        top = engine.performance.best_setups(5)
+        if not top:
+            await update.message.reply_text("Not enough data (need 10+ trades per bucket).")
+            return
+        lines = ["<b>Best Setups</b>"]
+        for label, s in top:
+            lines.append(f"  {esc(label)}: WR {s.win_rate:.0%} ({s.trades} trades) P&L ${s.total_pnl:+.2f}")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def worst_setups(update: Any, ctx: Any) -> None:
+        if not await _auth_or_reject(update):
+            return
+        from apex.telegram.formatters import esc
+        bottom = engine.performance.worst_setups(5)
+        if not bottom:
+            await update.message.reply_text("Not enough data (need 10+ trades per bucket).")
+            return
+        lines = ["<b>Worst Setups</b>"]
+        for label, s in bottom:
+            lines.append(f"  {esc(label)}: WR {s.win_rate:.0%} ({s.trades} trades) P&L ${s.total_pnl:+.2f}")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
     async def setstop(update: Any, ctx: Any) -> None:
         """Usage: /setstop <market_id> <stop%> [take%] [trail%]"""
         if not await _auth_or_reject(update):
@@ -609,6 +826,15 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         elif action == "confirm" and verb == "paper_off":
             engine.state.dry_run = False
             await query.edit_message_text("💸 LIVE mode on. Double-check env.")
+        elif action == "confirm" and verb == "mode":
+            from apex.core.trading_modes import TradingMode
+            try:
+                new_mode = TradingMode(payload)
+                engine.trading_mode = new_mode
+                engine.autopilot.mode = new_mode
+                await query.edit_message_text(f"✅ Mode switched to {new_mode.value}")
+            except ValueError:
+                await query.edit_message_text(f"Invalid mode: {payload}")
         elif action == "cancel":
             await query.edit_message_text("Cancelled.")
 
@@ -633,6 +859,16 @@ def make_handlers(engine: ApexEngine) -> dict[str, Any]:
         "risk": risk,
         "arb": arb,
         "costs": costs,
+        "mode": mode_cmd,
+        "modes": modes,
+        "current_mode": current_mode,
+        "autopilot": autopilot_cmd,
+        "crypto": crypto,
+        "predict_crypto": predict_crypto,
+        "claude_score": claude_score,
+        "performance": performance,
+        "best_setups": best_setups,
+        "worst_setups": worst_setups,
         "setstop": setstop,
         "pause": pause,
         "resume": resume,
