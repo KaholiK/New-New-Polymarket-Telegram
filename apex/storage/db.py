@@ -2,10 +2,19 @@
 
 A single long-lived connection is fine for this workload (single process, low QPS).
 Tables use plain columns, not ORMs — schema is small and explicit.
+
+Connection lifecycle
+--------------------
+``Database.connect()`` retries with exponential backoff (1s, 2s, 4s, 8s, 16s,
+capped at ``max_delay``) before giving up. ``is_healthy()`` checks the current
+connection with a cheap ``SELECT 1`` so background jobs can skip work when the
+DB is unreachable instead of spamming ``RuntimeError("Database not connected")``.
+``ensure_connected()`` transparently re-establishes a broken connection.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
@@ -191,19 +200,109 @@ class Database:
     def __init__(self, path: str = "apex.db") -> None:
         self.path = path
         self._conn: aiosqlite.Connection | None = None
+        self._connect_lock = asyncio.Lock()
+        self._last_error: str = ""
+        self._healthy: bool = False
 
-    async def connect(self) -> None:
-        if self._conn is None:
-            self._conn = await aiosqlite.connect(self.path)
-            self._conn.row_factory = aiosqlite.Row
-            await self._conn.execute("PRAGMA journal_mode=WAL")
-            await self._conn.execute("PRAGMA foreign_keys=ON")
-            await self.init_schema()
+    async def connect(
+        self,
+        attempts: int = 5,
+        base_delay: float = 1.0,
+        max_delay: float = 30.0,
+    ) -> None:
+        """Open the connection with exponential backoff.
+
+        Raises the final exception if every attempt fails; callers are expected
+        to catch and put the DB-dependent jobs in degraded mode.
+        """
+        async with self._connect_lock:
+            if self._conn is not None:
+                return
+            last_exc: Exception | None = None
+            for i in range(attempts):
+                try:
+                    conn = await aiosqlite.connect(self.path)
+                    conn.row_factory = aiosqlite.Row
+                    await conn.execute("PRAGMA journal_mode=WAL")
+                    await conn.execute("PRAGMA foreign_keys=ON")
+                    # busy_timeout helps during Railway Postgres-style restarts
+                    # (sqlite rarely hits this but 5s is cheap insurance).
+                    await conn.execute("PRAGMA busy_timeout=5000")
+                    self._conn = conn
+                    self._healthy = True
+                    self._last_error = ""
+                    await self.init_schema()
+                    logger.info(
+                        "db: connected (%s) on attempt %d/%d",
+                        self.path, i + 1, attempts,
+                    )
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    self._last_error = str(exc)
+                    self._healthy = False
+                    if i == attempts - 1:
+                        break
+                    delay = min(base_delay * (2**i), max_delay)
+                    logger.warning(
+                        "db: connect attempt %d/%d failed: %s (sleep %.1fs)",
+                        i + 1, attempts, exc, delay,
+                    )
+                    await asyncio.sleep(delay)
+            assert last_exc is not None
+            logger.error("db: connect failed after %d attempts: %s", attempts, last_exc)
+            raise last_exc
 
     async def close(self) -> None:
         if self._conn is not None:
-            await self._conn.close()
+            try:
+                await self._conn.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("db: close error: %s", exc)
             self._conn = None
+        self._healthy = False
+
+    async def ensure_connected(self) -> bool:
+        """Re-open the connection if it was dropped. Returns True if usable."""
+        if self._conn is not None and self._healthy:
+            return True
+        try:
+            await self.connect()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("db: ensure_connected failed: %s", exc)
+            return False
+
+    async def is_healthy(self) -> bool:
+        """Cheap liveness probe — SELECT 1. Marks the DB unhealthy on failure."""
+        if self._conn is None:
+            self._healthy = False
+            return False
+        try:
+            async with self._conn.execute("SELECT 1") as cur:
+                await cur.fetchone()
+            self._healthy = True
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._healthy = False
+            self._last_error = str(exc)
+            logger.warning("db: health probe failed: %s", exc)
+            # Drop the broken handle so the next ensure_connected() re-opens it.
+            try:
+                await self._conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._conn = None
+            return False
+
+    @property
+    def healthy(self) -> bool:
+        """Last-known health state (set by connect/is_healthy). No I/O."""
+        return self._healthy and self._conn is not None
+
+    @property
+    def last_error(self) -> str:
+        return self._last_error
 
     @property
     def conn(self) -> aiosqlite.Connection:

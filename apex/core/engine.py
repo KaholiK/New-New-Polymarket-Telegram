@@ -22,6 +22,7 @@ import httpx
 from apex.config import Settings, get_settings
 from apex.core.health import HealthRegistry
 from apex.core.models import Forecast, Market
+from apex.core.notify import configure_notifier
 from apex.core.state import BotState
 from apex.data.consensus_builder import build_consensus
 from apex.data.injury_feed import InjuryFeed
@@ -66,6 +67,19 @@ class EngineStats:
     signals_generated: int = 0
     decisions_approved: int = 0
     orders_placed: int = 0
+
+
+@dataclass
+class ServiceStatus:
+    """Lightweight per-service health snapshot for /status + graceful degradation."""
+
+    db_healthy: bool = True
+    odds_api_degraded: bool = False
+    odds_api_reason: str = ""
+    coingecko_degraded: bool = False
+    binance_degraded: bool = False
+    fear_greed_degraded: bool = False
+    polymarket_degraded: bool = False
 
 
 class ApexEngine:
@@ -169,6 +183,25 @@ class ApexEngine:
         self.startup_complete = False
         self.startup_started_at: float | None = None
 
+        # Admin notifier (Telegram alerts for operational events)
+        self.notifier = configure_notifier(
+            admin_chat_id=self.settings.admin_chat_id or None,
+            throttle_seconds=self.settings.admin_alert_throttle_seconds,
+        )
+
+        # Service status registry (DB, Odds, CoinGecko, Binance, Fear & Greed)
+        self.service_status = ServiceStatus()
+
+        # Crypto runtime state — populated by background jobs.
+        from apex.core.crypto_state import CryptoState
+
+        self.crypto_state = CryptoState()
+
+        # Alert / portfolio / watchlist services (DB-backed).
+        from apex.core.user_features import UserFeatures
+
+        self.user_features = UserFeatures(self.db)
+
     # ------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------
@@ -176,33 +209,80 @@ class ApexEngine:
     async def startup(self) -> None:
         """Bring the engine fully online and populate caches before returning.
 
-        Runs DB connect + Elo restore, then fires every ingest job once so that the
-        Telegram commands have real data to return within seconds of boot.
+        Runs DB connect + Elo restore, validates API keys, then fires every
+        initial ingest job once so Telegram commands have real data to return
+        within seconds of boot.
 
-        CRITICAL: `self.startup_complete` is set in a `finally` block so it is
-        guaranteed to become True even if DB connect or Elo restore fails. Without
-        this, every data command would be gated by ``_wait_for_startup`` forever.
+        CRITICAL: ``self.startup_complete`` is set in a ``finally`` block so it
+        is guaranteed to become True even if DB connect or Elo restore fails.
+        Otherwise, every data command would be gated by ``_wait_for_startup``
+        forever.
         """
         import time
 
         self.startup_started_at = time.monotonic()
+
+        # ---- DB connect with retry + health mark ----
         try:
-            await self.db.connect()
+            await self.db.connect(attempts=5, base_delay=1.0, max_delay=30.0)
             self.cost_tracker.db = self.db
+            self.user_features.db = self.db
+            self.service_status.db_healthy = True
+            self.health.mark_db(True)
             for sport, model in self.elo_models.items():
                 try:
                     rows = await self.db.load_elo(sport)
                     model.bulk_load(rows)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("elo restore %s failed: %s", sport, exc)
+            try:
+                await self.user_features.ensure_schema()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("user_features schema init failed: %s", exc)
         except Exception as exc:  # noqa: BLE001
-            logger.error("db/elo init failed: %s — continuing without persistence", exc)
+            self.service_status.db_healthy = False
+            self.health.mark_db(False, str(exc))
+            logger.error(
+                "db init failed after retries: %s — DB-dependent jobs will be skipped",
+                exc,
+            )
+            # One-shot admin alert (throttled by key).
+            try:
+                await self.notifier.critical(
+                    f"Database unreachable at startup: {exc}. "
+                    f"DB-dependent jobs are disabled until recovery.",
+                    key="db",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        # ---- Validate Odds API key with free sports-list call ----
+        try:
+            ok, reason = await self.odds.validate_key()
+            if not ok:
+                self.service_status.odds_api_degraded = True
+                self.service_status.odds_api_reason = reason
+                logger.warning("⚠️ ODDS_API_KEY is invalid — odds features disabled: %s", reason)
+                await self.notifier.critical(
+                    f"Odds API key invalid/unreachable: {reason}. "
+                    f"Odds ingestion disabled until restart.",
+                    key="odds_api",
+                )
+            else:
+                self.service_status.odds_api_degraded = False
+                self.service_status.odds_api_reason = ""
+                logger.info("Odds API key: configured and validated")
+        except Exception as exc:  # noqa: BLE001
+            self.service_status.odds_api_degraded = True
+            self.service_status.odds_api_reason = str(exc)
+            logger.warning("odds key validation raised: %s", exc)
 
         logger.info(
-            "engine: core up, bankroll=$%.2f, claude=%s, sportsdata=%s; running initial ingest…",
+            "engine: core up, bankroll=$%.2f, claude=%s, sportsdata=%s, db=%s; running initial ingest…",
             self.state.bankroll,
             "on" if self.claude.enabled else "off",
             "on" if self.sportsdata.enabled else "off",
+            "on" if self.service_status.db_healthy else "DEGRADED",
         )
 
         try:
@@ -212,6 +292,7 @@ class ApexEngine:
                 "ingest_odds": self.ingest_odds(),
                 "ingest_injuries": self.ingest_injuries(),
                 "ingest_news": self.ingest_news(),
+                "ingest_crypto": self.ingest_crypto(),
             }
             results = await asyncio.gather(*initial_jobs.values(), return_exceptions=True)
             for name, res in zip(initial_jobs.keys(), results):
@@ -225,12 +306,41 @@ class ApexEngine:
             # "starting up, please wait".
             self.startup_complete = True
 
+        # Summary notification to admin (includes any degraded services).
+        degraded = []
+        if not self.service_status.db_healthy:
+            degraded.append("DB")
+        if self.service_status.odds_api_degraded:
+            degraded.append("Odds API")
+        if self.service_status.coingecko_degraded:
+            degraded.append("CoinGecko")
+        if self.service_status.binance_degraded:
+            degraded.append("Binance")
+        if self.service_status.fear_greed_degraded:
+            degraded.append("Fear & Greed")
+        startup_msg = (
+            f"APEX started — {len(self.markets_by_condition)} markets, "
+            f"{sum(len(v) for v in self.injuries_by_sport.values())} injuries, "
+            f"{len(self.fresh_news)} news, "
+            f"{len(self.crypto_state.prices)} coins."
+        )
+        if degraded:
+            startup_msg += f" ⚠️ Degraded: {', '.join(degraded)}."
+        try:
+            if degraded:
+                await self.notifier.warning(startup_msg, key="startup")
+            else:
+                await self.notifier.info(startup_msg, key="startup")
+        except Exception:  # noqa: BLE001
+            pass
+
         logger.info(
-            "engine: startup_complete=True — %d markets, %d injury_sports, %d news, %d elo_teams",
+            "engine: startup_complete=True — %d markets, %d injury_sports, %d news, %d elo_teams, %d coins",
             len(self.markets_by_condition),
             len(self.injuries_by_sport),
             len(self.fresh_news),
             sum(len(m.ratings) for m in self.elo_models.values()),
+            len(self.crypto_state.prices),
         )
 
     def start_periodic_tasks(self) -> None:
@@ -252,10 +362,17 @@ class ApexEngine:
             ("ingest_stats", self.ingest_stats, s.results_tracker_interval),
             ("ingest_injuries", self.ingest_injuries, max(60, s.injury_max_age // 2)),
             ("ingest_news", self.ingest_news, max(60, s.news_max_age // 2)),
+            # Crypto background refresh: prices every 5 min, klines every 15 min,
+            # fear & greed every 30 min, alerts checked on every price tick.
+            ("crypto_prices", self.ingest_crypto_prices, 5 * 60),
+            ("crypto_klines", self.ingest_crypto_klines, 15 * 60),
+            ("fear_greed", self.ingest_fear_greed, 30 * 60),
+            ("check_alerts", self.check_price_alerts, 60),
             ("strategy_cycle", _cycle, s.strategy_cycle_interval),
             ("poll_fills", self.poll_fills, s.fill_poll_interval),
             ("poll_resolutions", self.poll_resolutions, s.resolution_poll_interval),
             ("poll_results", self.poll_results, s.results_tracker_interval),
+            ("db_health", self.check_db_health, 60),
         ]
 
         for name, fn, interval in jobs:
@@ -365,17 +482,41 @@ class ApexEngine:
             logger.info("news ingest: %d new items", len(fresh))
 
     async def ingest_odds(self) -> dict[str, Any]:
-        """Pull multi-book odds, build consensus, track line movement."""
+        """Pull multi-book odds, build consensus, track line movement.
+
+        Short-circuits on auth failure: if the first sport returns 401/403 the
+        remaining sports are skipped for this cycle (same key would fail anyway).
+        """
         out: dict[str, Any] = {}
         total = 0
+        # Clear any previous auth-failure marker so recovery can happen.
+        self.odds.reset_cycle()
         for sport in DEFAULT_SPORTS:
+            if self.odds.degraded:
+                # First sport already 401'd — don't waste retries on the rest.
+                break
             snaps = await self.odds.fetch_odds(sport)
             total += len(snaps)
             self.line_mov.ingest(snaps)
             consensus = build_consensus(snaps)
             out[sport] = consensus
-        self.source_health.record_success("odds")
-        self.health.record_success("odds", 0.0)
+        # Reflect ingestor state into the service_status (for /status dashboard).
+        if self.odds.auth_failed:
+            if not self.service_status.odds_api_degraded:
+                await self.notifier.critical(
+                    f"Odds API authentication failed ({self.odds.last_error}). "
+                    f"Odds features disabled until key is fixed.",
+                    key="odds_api",
+                )
+            self.service_status.odds_api_degraded = True
+            self.service_status.odds_api_reason = self.odds.last_error
+        elif total and self.service_status.odds_api_degraded:
+            self.service_status.odds_api_degraded = False
+            self.service_status.odds_api_reason = ""
+            await self.notifier.recovery("Odds API recovered — ingestion resumed", key="odds_api")
+        if not self.service_status.odds_api_degraded:
+            self.source_health.record_success("odds")
+            self.health.record_success("odds", 0.0)
         if total:
             logger.info("odds ingest: %d snapshots across %d sports", total, len(DEFAULT_SPORTS))
         return out
@@ -557,7 +698,18 @@ class ApexEngine:
         await self.dry.tick()
 
     async def poll_resolutions(self) -> None:
-        rows = await self.db.get_open_trades()
+        # Skip if DB is unreachable so we don't spam the log with
+        # "Database not connected". check_db_health() owns reconnection.
+        if not self.service_status.db_healthy:
+            return
+        try:
+            rows = await self.db.get_open_trades()
+        except RuntimeError as exc:
+            # Lost the connection between health check and query — mark degraded.
+            logger.warning("poll_resolutions: DB access failed: %s", exc)
+            self.service_status.db_healthy = False
+            self.health.mark_db(False, str(exc))
+            return
         from apex.core.models import Side, Trade, TradeStatus
 
         trades = []
@@ -646,6 +798,159 @@ class ApexEngine:
             f"📋 Placed: <b>{side.value}</b> ${size_usd:.2f} @ {price:.3f} "
             f"({contracts:.2f} contracts) on {market.question[:60]}"
         )
+
+    # ------------------------------------------------------------
+    # Crypto ingest
+    # ------------------------------------------------------------
+
+    TRACKED_COINS: tuple[str, ...] = (
+        "btc", "eth", "sol", "ada", "avax",
+        "link", "dot", "matic", "doge",
+    )
+    KLINE_COINS: tuple[str, ...] = ("btc", "eth", "sol")
+
+    async def ingest_crypto(self) -> None:
+        """One-shot initial crypto fetch (prices + klines + fear-greed)."""
+        await asyncio.gather(
+            self.ingest_crypto_prices(),
+            self.ingest_crypto_klines(),
+            self.ingest_fear_greed(),
+            return_exceptions=True,
+        )
+
+    async def ingest_crypto_prices(self) -> None:
+        """CoinGecko /simple/price for all tracked coins."""
+        updated = 0
+        any_failure = False
+        for asset in self.TRACKED_COINS:
+            try:
+                data = await self.crypto_client.get_price(asset)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("crypto price fetch failed for %s: %s", asset, exc)
+                any_failure = True
+                continue
+            if data and data.get("price_usd") is not None:
+                self.crypto_state.update_price(asset, data)
+                updated += 1
+            else:
+                any_failure = True
+        if any_failure and updated == 0:
+            if not self.service_status.coingecko_degraded:
+                await self.notifier.warning(
+                    "CoinGecko unreachable — crypto prices stale", key="coingecko"
+                )
+            self.service_status.coingecko_degraded = True
+        elif updated and self.service_status.coingecko_degraded:
+            self.service_status.coingecko_degraded = False
+            await self.notifier.recovery("CoinGecko recovered — prices refreshing", key="coingecko")
+        self.source_health.record_success("coingecko", payload=updated)
+        if updated:
+            logger.info("crypto prices refreshed: %d/%d coins", updated, len(self.TRACKED_COINS))
+
+    async def ingest_crypto_klines(self) -> None:
+        """Binance klines for the deep-analysis subset (BTC/ETH/SOL)."""
+        total = 0
+        any_ok = False
+        for asset in self.KLINE_COINS:
+            for interval in ("1h", "4h"):
+                try:
+                    bars = await self.crypto_client.get_klines(
+                        asset, interval=interval, limit=200
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "binance klines failed for %s %s: %s", asset, interval, exc
+                    )
+                    continue
+                if bars:
+                    self.crypto_state.update_klines(asset, interval, bars)
+                    total += len(bars)
+                    any_ok = True
+        if not any_ok:
+            if not self.service_status.binance_degraded:
+                await self.notifier.warning(
+                    "Binance klines unreachable — technical model degraded", key="binance"
+                )
+            self.service_status.binance_degraded = True
+        elif any_ok and self.service_status.binance_degraded:
+            self.service_status.binance_degraded = False
+            await self.notifier.recovery("Binance klines recovered", key="binance")
+        self.source_health.record_success("binance", payload=total)
+        if total:
+            logger.info("crypto klines refreshed: %d bars total", total)
+
+    async def ingest_fear_greed(self) -> None:
+        """alternative.me Fear & Greed index."""
+        try:
+            data = await self.crypto_client.get_fear_greed()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fear_greed fetch failed: %s", exc)
+            data = None
+        if data:
+            self.crypto_state.set_fear_greed(data)
+            if self.service_status.fear_greed_degraded:
+                await self.notifier.recovery("Fear & Greed recovered", key="fear_greed")
+            self.service_status.fear_greed_degraded = False
+            self.source_health.record_success("fear_greed", payload=data.get("value"))
+            logger.info("fear_greed: %s (%s)", data.get("value"), data.get("classification"))
+        else:
+            if not self.service_status.fear_greed_degraded:
+                await self.notifier.warning(
+                    "Fear & Greed index unreachable — sentiment degraded", key="fear_greed"
+                )
+            self.service_status.fear_greed_degraded = True
+
+    async def check_price_alerts(self) -> None:
+        """Fire any triggered user price alerts based on latest prices."""
+        if not self.service_status.db_healthy:
+            return
+        fired = []
+        try:
+            fired = await self.user_features.check_alerts(self.crypto_state)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("check_alerts failed: %s", exc)
+            return
+        if not fired:
+            return
+        bot = getattr(self.notifier, "_bot", None)
+        for alert in fired:
+            text = (
+                f"🚨 <b>ALERT</b>: {alert['coin'].upper()} just crossed "
+                f"{alert['direction']} ${alert['target_price']:,.2f} "
+                f"(now ${alert['current_price']:,.2f})"
+            )
+            try:
+                if bot is not None:
+                    await bot.send_message(
+                        chat_id=alert["user_id"], text=text, parse_mode="HTML"
+                    )
+                else:
+                    logger.info("alert fired (no transport): %s", text)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("failed to deliver alert to %s: %s", alert["user_id"], exc)
+
+    # ------------------------------------------------------------
+    # DB health & recovery loop
+    # ------------------------------------------------------------
+
+    async def check_db_health(self) -> None:
+        """Probe DB and try to recover; alert admin on state transitions."""
+        was_healthy = self.service_status.db_healthy
+        ok = await self.db.is_healthy()
+        if not ok:
+            # Probe failed — try to reconnect.
+            ok = await self.db.ensure_connected()
+        self.service_status.db_healthy = ok
+        self.health.mark_db(ok, "" if ok else self.db.last_error)
+        if was_healthy and not ok:
+            await self.notifier.critical(
+                f"Database unhealthy: {self.db.last_error or 'unknown error'}",
+                key="db",
+            )
+        elif not was_healthy and ok:
+            await self.notifier.recovery(
+                "Database reconnected — DB-dependent jobs resumed", key="db"
+            )
 
     async def evaluate_and_place(self, signals: list) -> None:
         """Score each signal, then place approved decisions."""

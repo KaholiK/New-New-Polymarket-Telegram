@@ -155,20 +155,41 @@ class MarketDiscovery:
         self.client = client
 
     async def scan_active_markets(
-        self, max_markets: int = 500, min_confidence: float = 0.0
+        self,
+        max_markets: int = 500,
+        min_confidence: float = 0.0,
+        max_pages: int = 10,
+        inter_page_delay_s: float = 0.1,
     ) -> list[Market]:
-        """Fetch active Gamma markets, parse, filter to sports markets above confidence."""
+        """Fetch active Gamma markets, parse, filter to sports markets above confidence.
+
+        Early-termination rules (any of these stops the loop):
+          * ``max_markets`` reached after filtering
+          * Upstream returns an empty page
+          * Upstream returns fewer than ``page_size`` rows (last page)
+          * ``max_pages`` pages fetched (hard upper bound — prevents runaway
+            pagination when filter is very selective)
+        """
         out: list[Market] = []
         offset = 0
         page_size = 100
-        while len(out) < max_markets:
+        pages = 0
+        total_raw = 0
+        while len(out) < max_markets and pages < max_pages:
             try:
-                batch = await self.client.list_markets(closed=False, limit=page_size, offset=offset)
+                batch = await self.client.list_markets(
+                    closed=False, limit=page_size, offset=offset
+                )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("discovery: list_markets failed at offset=%d: %s", offset, exc)
+                logger.warning(
+                    "discovery: list_markets failed at offset=%d: %s", offset, exc
+                )
                 break
+            pages += 1
             if not batch:
+                logger.debug("discovery: empty page at offset=%d — stopping", offset)
                 break
+            total_raw += len(batch)
             for raw in batch:
                 m = market_from_gamma(raw)
                 if m is None:
@@ -178,8 +199,22 @@ class MarketDiscovery:
                 out.append(m)
                 if len(out) >= max_markets:
                     break
+            logger.debug(
+                "discovery: page offset=%d got %d raw (kept %d, running total %d)",
+                offset, len(batch), len(out), len(out),
+            )
             if len(batch) < page_size:
+                # Last page — upstream has no more data.
                 break
             offset += page_size
-        logger.info("discovery: scanned %d active markets", len(out))
+            if inter_page_delay_s > 0:
+                # Be polite to the Gamma API — minimal pacing between pages.
+                import asyncio
+
+                await asyncio.sleep(inter_page_delay_s)
+        saved = max(0, max_pages - pages) if len(out) >= max_markets else 0
+        logger.info(
+            "discovery: %d markets from %d pages (%d raw scanned, saved %d requests)",
+            len(out), pages, total_raw, saved,
+        )
         return out
